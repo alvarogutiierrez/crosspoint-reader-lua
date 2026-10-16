@@ -1963,6 +1963,23 @@ bool ScriptHost::load(const std::string& name) {
 
 
   // require confined to the app root (replace the default searchers).
+  // Sandbox parity (and safety): the contract's sandbox has no io/os/dofile/
+  // loadfile/load, so an app cannot read arbitrary SD files or compile code at
+  // runtime. `print` stays as a debug aid (apps written for the device use
+  // ctx.log; keeping print costs nothing and helps when bench-debugging), and
+  // `package` stays because require() is what resolves our flat app bundles —
+  // its searchers are confined to the app root.
+  lua_pushnil(L);
+  lua_setglobal(L, "dofile");
+  lua_pushnil(L);
+  lua_setglobal(L, "loadfile");
+  lua_pushnil(L);
+  lua_setglobal(L, "load");
+  lua_pushnil(L);
+  lua_setglobal(L, "io");
+  lua_pushnil(L);
+  lua_setglobal(L, "os");
+
   luaL_requiref(L, "package", luaopen_package, 1);
   lua_pop(L, 1);
   lua_getglobal(L, "package");
