@@ -245,6 +245,9 @@ void HomeActivity::onEnter() {
     fillCoverGridFromLibrary();
     resolveGridCoverPaths();
     coverGridUi->begin(recentBooks, hasLibrarySlot(), hasContinueReading);
+    // First page: the carousel of books started and not finished. Built here,
+    // on the main loop, because each entry costs an Epub metadata load.
+    coverGridUi->buildFlow();
   }
 
   const auto base = static_cast<int>(recentBooks.size());
@@ -348,6 +351,42 @@ void HomeActivity::loop() {
   }
 
   const auto swipe = mappedInput.wasSwipe();
+
+  // First page: the cover flow of books started and not finished. It owns the
+  // arrows and the horizontal swipe until the reader travels down to the home
+  // below — the wide chevron under the carousel is what says so.
+  if (coverGridUi && coverGridUi->isFlowPage()) {
+    if (mappedInput.wasPressed(MappedInputManager::Button::Down) || swipe == MappedInputManager::SwipeDir::Up) {
+      coverGridUi->setPage(1);
+      requestUpdate();
+      return;
+    }
+    if (mappedInput.wasPressed(MappedInputManager::Button::Left) || swipe == MappedInputManager::SwipeDir::Right) {
+      coverGridUi->flowMove(-1);
+      requestUpdate();
+      return;
+    }
+    if (mappedInput.wasPressed(MappedInputManager::Button::Right) || swipe == MappedInputManager::SwipeDir::Left) {
+      coverGridUi->flowMove(1);
+      requestUpdate();
+      return;
+    }
+    const int touched = coverGridUi->selectedAction(mappedInput);
+    if (mappedInput.wasReleased(MappedInputManager::Button::Confirm) || touched >= 0) {
+      const RecentBook* flowBook = coverGridUi->flowCurrent();
+      if (flowBook != nullptr) onSelectBook(flowBook->path);
+      return;
+    }
+    // Nothing on this page consumed the event: fall through so Back still opens
+    // the most recent book.
+  } else if (coverGridUi && coverGridUi->getPage() == 1 && coverGridUi->flowHasBooks() && selectorIndex == 0 &&
+             (mappedInput.wasPressed(MappedInputManager::Button::Up) || swipe == MappedInputManager::SwipeDir::Down)) {
+    // Travelling back up from the top of the home returns to the carousel.
+    coverGridUi->setPage(0);
+    requestUpdate();
+    return;
+  }
+
   if (swipe == MappedInputManager::SwipeDir::Up) {
     selectorIndex = ButtonNavigator::nextIndex(selectorIndex, menuCount);
     requestUpdate();

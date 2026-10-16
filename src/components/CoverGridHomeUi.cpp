@@ -5,6 +5,7 @@
 #include <I18n.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <utility>
 
@@ -124,13 +125,23 @@ void CoverGridHomeUi::draw(UiScreen& screen) {
   // tall and every cover on screen shares one size. The metadata floor still
   // applies when the rows would be too short for the hero's text lines.
   const fui::Rect body = screen.body();
+  lastBody = body;  // sizing source for prepareHeroCard, which has no screen
   const int rowGap = std::max<int>(4, body.width / 100);
   grid.gap = grid.rowGap = rowGap;
   const int coverRowHeight = std::max(1, (body.height - theme.spaceSm - 2 * rowGap) / 3 + COVER_ROW_EXTRA_HEIGHT);
   const int16_t featuredHeight = std::min<int>(
       body.height, std::max<int>(coverRowHeight, screen.target().lineHeight(theme.bodyText.font) * (landscape ? 1 : 2) +
                                                      screen.target().lineHeight(theme.smallText.font) * 2 + 32));
-  drawCurrent(screen, screen.takeTop(featuredHeight, theme.spaceSm), coverRowHeight);
+  fui::Rect heroRect = screen.takeTop(featuredHeight, theme.spaceSm);
+  prepareHeroCard(heroRect, coverRowHeight);
+  // First page: the cover flow of books that were started and not finished.
+  // Its walking chevron travels down to the home below, which is unchanged.
+  if (isFlowPage()) {
+    drawFlow(screen, heroRect);
+    drawHeaderBand();
+    return;
+  }
+  drawCurrent(screen, heroRect, coverRowHeight);
   drawGrid(screen);
   tabRect.x = gridBounds.x + grid.cellInset.left;
   tabRect.width = gridBounds.width - grid.cellInset.left - grid.cellInset.right;
@@ -166,6 +177,23 @@ void CoverGridHomeUi::drawEmpty(UiScreen& screen) {
   screen.target().text(fui::Rect{body.x, y, body.width, messageHeight}, tr(STR_START_READING), message);
 }
 
+void CoverGridHomeUi::prepareHeroCard(fui::Rect& rect, const int coverRowHeight) {
+  // Fit the shared 2:3 cover box within both the row and a grid column. No gap
+  // reserve: the cell insets already keep adjacent covers apart, and the
+  // SpaceBetween layout absorbs whatever slack remains.
+  const int maxCoverWidth = rect.width / GRID_COLUMNS - 2 * COVER_CELL_INSET;
+  card.coverSize.height = std::max(1, std::min(std::min<int>(rect.height, coverRowHeight) - 12, maxCoverWidth * 3 / 2));
+  card.coverSize.width = std::max(1, card.coverSize.height * 2 / 3);
+  noteThumbHeight(card.coverSize.height);
+  gridBounds = layoutGrid(lastBody);
+  rect.x = gridBounds.x;
+  rect.width = gridBounds.width;
+  card.coverPainterUserData = this;
+  card.coverPainter = [](fui::DrawTarget& target, fui::Rect cover, const fui::BookCardProps&, void* user) {
+    return static_cast<CoverGridHomeUi*>(user)->paintFramedCover(target, cover, 0);
+  };
+}
+
 void CoverGridHomeUi::drawCurrent(UiScreen& screen, fui::Rect rect, const int coverRowHeight) {
   const auto& theme = screen.theme();
   const auto& book = books->front();
@@ -197,20 +225,6 @@ void CoverGridHomeUi::drawCurrent(UiScreen& screen, fui::Rect rect, const int co
   card.progressHeight = 6;
   card.padding = fui::Insets{6, 6, 6, 6};
   card.gap = theme.spaceLg + theme.spaceSm;
-  // Fit the shared 2:3 cover box within both the row and a grid column. No
-  // gap reserve: the cell insets already keep adjacent covers apart, and the
-  // SpaceBetween layout absorbs whatever slack remains.
-  const int maxCoverWidth = rect.width / GRID_COLUMNS - 2 * COVER_CELL_INSET;
-  card.coverSize.height = std::max(1, std::min(std::min<int>(rect.height, coverRowHeight) - 12, maxCoverWidth * 3 / 2));
-  card.coverSize.width = std::max(1, card.coverSize.height * 2 / 3);
-  noteThumbHeight(card.coverSize.height);
-  gridBounds = layoutGrid(screen.body());
-  rect.x = gridBounds.x;
-  rect.width = gridBounds.width;
-  card.coverPainterUserData = this;
-  card.coverPainter = [](fui::DrawTarget& target, fui::Rect cover, const fui::BookCardProps&, void* user) {
-    return static_cast<CoverGridHomeUi*>(user)->paintFramedCover(target, cover, 0);
-  };
   fui::bookCard(screen.frame(), rect, card);
 
   if (selected == 0 && !BoardConfig::hasTouch()) {
@@ -296,6 +310,148 @@ void CoverGridHomeUi::drawTabs(UiScreen& screen, fui::Rect rect) {
   tabs.selectedUnderline = 2;
   tabs.distributedSlotWidth = 0;
   fui::tabBar(screen.frame(), rect, tabs);
+}
+
+// --- first page: the cover flow ---------------------------------------------
+//
+// The books that were STARTED and not finished, as a carousel. It is the first
+// thing the home shows; the wide chevron under the carousel travels down to the
+// home that already existed, which is otherwise untouched.
+
+void CoverGridHomeUi::buildFlow() {
+  flowBooks.clear();
+  flowPercent.clear();
+  flowIndex = 0;
+  if (books == nullptr) return;
+  // "Started but not finished": loadBookProgress is the saved percentage, so
+  // both edges are real data instead of a guess about which entries were opened.
+  // Each entry costs an Epub metadata load, hence once per home entry and never
+  // from the render task.
+  for (const RecentBook& b : *books) {
+    if (flowBooks.size() >= HomeCoverCache::MAX_COVERS) break;
+    const int pct = loadBookProgress(b.path);
+    if (pct <= 0 || pct >= 100) continue;
+    flowBooks.push_back(b);
+    flowPercent.push_back(pct);
+  }
+  LOG_INF("HOME", "cover flow: %u unfinished of %u recents", static_cast<unsigned>(flowBooks.size()),
+          static_cast<unsigned>(books->size()));
+  page = 0;  // when there is a flow, the flow is what the home opens on
+}
+
+void CoverGridHomeUi::flowMove(const int delta) {
+  const int n = flowCount();
+  if (n <= 0) return;
+  flowIndex = std::max(0, std::min(n - 1, flowIndex + delta));
+}
+
+const RecentBook* CoverGridHomeUi::flowCurrent() const {
+  if (flowIndex < 0 || flowIndex >= flowCount()) return nullptr;
+  return &flowBooks[flowIndex];
+}
+
+void CoverGridHomeUi::drawFlow(UiScreen& screen, const fui::Rect heroRect) {
+  if (flowBooks.empty()) return;
+  const auto& theme = screen.theme();
+  auto& target = screen.target();
+  const int n = flowCount();
+  if (flowIndex >= n) flowIndex = n - 1;
+  if (flowIndex < 0) flowIndex = 0;
+
+  // Title of the book the carousel is showing, centred above the covers.
+  const int16_t titleH = target.lineHeight(theme.titleText.font);
+  {
+    auto title = theme.titleText;
+    title.bold = true;
+    title.align = fui::TextAlign::Center;
+    title.maxLines = 2;
+    target.text(fui::Rect{heroRect.x, heroRect.y, heroRect.width, static_cast<int16_t>(titleH * 2)},
+                flowBooks[flowIndex].title.c_str(), title);
+  }
+
+  // Carousel: the neighbours are the SAME size as the centre cover. The thumb
+  // cache holds one size and rescaling a dithered 1-bit cover aliases badly, so
+  // the fan comes from pushing them off the edges, not from shrinking them.
+  const int16_t cw = card.coverSize.width;
+  const int16_t ch = card.coverSize.height;
+  const int16_t cx = static_cast<int16_t>(heroRect.x + (heroRect.width - cw) / 2);
+  const int16_t cy = static_cast<int16_t>(heroRect.y + titleH * 2 + theme.spaceSm);
+  const int16_t gap = static_cast<int16_t>(theme.spaceSm + 2);
+  if (flowIndex > 0) {
+    paintFlowCover(target, 0, flowIndex - 1, fui::Rect{static_cast<int16_t>(cx - cw - gap), cy, cw, ch}, false);
+  }
+  if (flowIndex + 1 < n) {
+    paintFlowCover(target, 1, flowIndex + 1, fui::Rect{static_cast<int16_t>(cx + cw + gap), cy, cw, ch}, false);
+  }
+  paintFlowCover(target, 2, flowIndex, fui::Rect{cx, cy, cw, ch}, true);
+
+  // Reading line under the carousel...
+  int16_t y = static_cast<int16_t>(cy + ch + theme.spaceSm);
+  {
+    auto meta = theme.smallText;
+    meta.align = fui::TextAlign::Center;
+    char line[24];
+    snprintf(line, sizeof(line), "%d%%", flowPercent[flowIndex]);
+    const int16_t h = target.lineHeight(meta.font);
+    target.text(fui::Rect{heroRect.x, y, heroRect.width, h}, line, meta);
+    y = static_cast<int16_t>(y + h);
+  }
+  // ...then the chevron: a WIDE two-stroke ∨, no shaft and no filled triangle,
+  // drawn as two lines from a top-centre point down-left and down-right, wider
+  // than the footer page-turn arrows, pointing at the home below.
+  const int16_t chevY = static_cast<int16_t>(y + theme.spaceLg);
+  const int16_t halfSpan = static_cast<int16_t>(std::min<int>(110, heroRect.width / 4));
+  const int16_t drop = static_cast<int16_t>(halfSpan * 2 / 3);
+  const int16_t midX = static_cast<int16_t>(heroRect.x + heroRect.width / 2);
+  if (chevY + drop < screen.body().bottom()) {
+    renderer.drawLine(midX - halfSpan, chevY, midX, static_cast<int16_t>(chevY + drop), true);
+    renderer.drawLine(midX, static_cast<int16_t>(chevY + drop), midX + halfSpan, chevY, true);
+  }
+}
+
+void CoverGridHomeUi::paintFlowCover(fui::DrawTarget& target, const size_t slot, const int index,
+                                     const fui::Rect rect, const bool centre) {
+  if (index < 0 || index >= flowCount()) return;
+  const auto ink = fui::Paint::solid(fui::Color::Black);
+  // Shadow: only the centre cover shows much of it, the neighbours are half
+  // hidden behind it (and a wider shadow would just cost a wider repaint).
+  const int16_t off = centre ? 3 : 2;
+  target.fill(fui::Rect{rect.right(), static_cast<int16_t>(rect.y + off), off, rect.height}, ink);
+  target.fill(fui::Rect{static_cast<int16_t>(rect.x + off), rect.bottom(), rect.width, off}, ink);
+  const std::string path = UITheme::getCoverThumbPath(flowBooks[index].coverBmpPath, thumbHeightFor());
+  if (path.empty()) return;
+  coverCache.paint(rect, slot, path);
+  if (centre) roundCoverCorners(rect, 10);
+}
+
+void CoverGridHomeUi::roundCoverCorners(const fui::Rect rect, const int radius) {
+  if (radius <= 0 || rect.width < 2 * radius || rect.height < 2 * radius) return;
+  const int16_t x0 = rect.x, y0 = rect.y;
+  const int16_t x1 = static_cast<int16_t>(rect.right() - 1);
+  const int16_t y1 = static_cast<int16_t>(rect.bottom() - 1);
+  // Clear the four corner pockets that fall outside the rounded shape...
+  for (int dy = 0; dy < radius; ++dy) {
+    for (int dx = 0; dx < radius; ++dx) {
+      const double ddx = radius - dx - 0.5;
+      const double ddy = radius - dy - 0.5;
+      if (ddx * ddx + ddy * ddy <= static_cast<double>(radius) * radius) continue;
+      renderer.drawPixel(x0 + dx, y0 + dy, false);
+      renderer.drawPixel(x1 - dx, y0 + dy, false);
+      renderer.drawPixel(x0 + dx, y1 - dy, false);
+      renderer.drawPixel(x1 - dx, y1 - dy, false);
+    }
+  }
+  // ...then trace the arc that is left, so the centre cover reads as a card.
+  const double rr = radius - 1.0;
+  for (int a = 0; a <= 90; ++a) {
+    const double rad = a * 3.14159265358979 / 180.0;
+    const int offx = static_cast<int>(radius - 0.5 - rr * std::cos(rad) + 0.5);
+    const int offy = static_cast<int>(radius - 0.5 - rr * std::sin(rad) + 0.5);
+    renderer.drawPixel(x0 + offx, y0 + offy, true);
+    renderer.drawPixel(x1 - offx, y0 + offy, true);
+    renderer.drawPixel(x0 + offx, y1 - offy, true);
+    renderer.drawPixel(x1 - offx, y1 - offy, true);
+  }
 }
 
 bool CoverGridHomeUi::paintFramedCover(fui::DrawTarget& target, fui::Rect rect, size_t index) {
