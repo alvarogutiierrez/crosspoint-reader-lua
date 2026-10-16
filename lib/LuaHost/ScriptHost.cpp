@@ -791,7 +791,36 @@ int i18n_t(lua_State* L) {
   const int base = (lua_type(L, 1) == LUA_TTABLE) ? 2 : 1;
   const char* key = luaL_checkstring(L, base);
   const char* value = (host != nullptr) ? host->i18nLookup(key) : nullptr;
-  lua_pushstring(L, value != nullptr ? value : key);
+  // Missing key falls back to the key itself (contract section 8).
+  std::string out = value != nullptr ? value : key;
+  // In a language file the two characters "\n" mean a line break.
+  for (size_t p = out.find("\\n"); p != std::string::npos; p = out.find("\\n", p + 1)) {
+    out.replace(p, 2, "\n");
+  }
+  // {name} -> tostring(params.name); a name the table does not carry stays as
+  // written (contract section 8).
+  if (lua_istable(L, base + 1)) {
+    size_t p = 0;
+    while ((p = out.find('{', p)) != std::string::npos) {
+      const size_t close = out.find('}', p + 1);
+      if (close == std::string::npos) break;
+      const std::string name = out.substr(p + 1, close - p - 1);
+      lua_getfield(L, base + 1, name.c_str());
+      bool replaced = false;
+      if (lua_isstring(L, -1) || lua_isnumber(L, -1)) {
+        size_t vlen = 0;
+        const char* v = lua_tolstring(L, -1, &vlen);
+        if (v != nullptr) {
+          out.replace(p, close - p + 1, std::string(v, vlen));
+          p += vlen;
+          replaced = true;
+        }
+      }
+      lua_pop(L, 1);
+      if (!replaced) p = close + 1;
+    }
+  }
+  lua_pushlstring(L, out.c_str(), out.size());
   return 1;
 }
 
@@ -1907,8 +1936,91 @@ int ctx_screen(lua_State* L) {
 }
 
 int ctx_invalidate(lua_State* L) {
-  hostOf(L)->requestInvalidate();
+  ScriptHost* host = hostOf(L);
+  const int base = lua_type(L, 1) == LUA_TTABLE ? 2 : 1;
+  // 2.x: the argument is the WAVEFORM — omitted is a local refresh, "full" a
+  // full one (which also clears ghosting). Anything else is invalid_argument.
+  if (lua_isnoneornil(L, base)) {
+    host->requestInvalidate();
+    return 0;
+  }
+  const char* mode = lua_tostring(L, base);
+  if (mode != nullptr && strcmp(mode, "full") == 0) {
+    host->requestFullRefresh();
+    host->requestInvalidate();
+    return 0;
+  }
+  lua_pushnil(L);
+  lua_pushliteral(L, "invalid_argument");
+  return 2;
+}
+
+// ctx:set_tick(ms) (2.x): 33..60000, or 0 to stop. The 0.8 name set_tick_rate
+// with its level strings keeps working.
+int ctx_set_tick(lua_State* L) {
+  ScriptHost* host = hostOf(L);
+  const int base = lua_type(L, 1) == LUA_TTABLE ? 2 : 1;
+  const lua_Integer ms = luaL_checkinteger(L, base);
+  if (ms != 0 && (ms < 33 || ms > 60000)) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "invalid_argument");
+    return 2;
+  }
+  host->setTickIntervalMs(static_cast<uint32_t>(ms));
   return 0;
+}
+
+// ctx:defer_full_refresh(ms) (2.x, section 5).
+int ctx_defer_full_refresh(lua_State* L) {
+  ScriptHost* host = hostOf(L);
+  const int base = lua_type(L, 1) == LUA_TTABLE ? 2 : 1;
+  const lua_Integer ms = luaL_checkinteger(L, base);
+  if (ms < 1 || ms > 60000) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "invalid_argument");
+    return 2;
+  }
+  host->deferAutoFullUntil = millis() + static_cast<uint32_t>(ms);
+  return 0;
+}
+
+int timer_cancel(lua_State* L) {
+  ScriptHost* host = hostOf(L);
+  int id = -1;
+  if (lua_istable(L, 1)) {
+    lua_getfield(L, 1, "id");
+    if (lua_isnumber(L, -1)) id = static_cast<int>(lua_tointeger(L, -1));
+    lua_pop(L, 1);
+  }
+  if (host != nullptr && id >= 0) host->cancelTimer(id);
+  return 0;
+}
+
+// ctx:after(ms, fn) (2.x): a one-shot timer, at most 32 pending.
+int ctx_after(lua_State* L) {
+  ScriptHost* host = hostOf(L);
+  const int base = lua_type(L, 1) == LUA_TTABLE ? 2 : 1;
+  const lua_Integer ms = luaL_checkinteger(L, base);
+  if (ms < 1 || ms > 2147483647LL || !lua_isfunction(L, base + 1)) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "invalid_argument");
+    return 2;
+  }
+  lua_pushvalue(L, base + 1);
+  const int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+  const int id = (host != nullptr) ? host->addTimer(static_cast<uint32_t>(ms), ref) : -1;
+  if (id < 0) {
+    luaL_unref(L, LUA_REGISTRYINDEX, ref);
+    lua_pushnil(L);
+    lua_pushliteral(L, "limit_exceeded");
+    return 2;
+  }
+  lua_createtable(L, 0, 2);
+  lua_pushinteger(L, id);
+  lua_setfield(L, -2, "id");
+  lua_pushcfunction(L, timer_cancel);
+  lua_setfield(L, -2, "cancel");
+  return 1;
 }
 
 int ctx_set_tick_rate(lua_State* L) {
@@ -1972,6 +2084,9 @@ int ctx_save(lua_State* L) {
 const luaL_Reg ctxFuncs[] = {
     {"invalidate", ctx_invalidate},
     {"set_tick_rate", ctx_set_tick_rate},
+    {"set_tick", ctx_set_tick},
+    {"after", ctx_after},
+    {"defer_full_refresh", ctx_defer_full_refresh},
     {"quit", ctx_quit},
     {"request_refresh", ctx_request_refresh},
     {"save", ctx_save},
@@ -2382,8 +2497,10 @@ bool ScriptHost::evictAsset(const char* key) {
 const char* ScriptHost::i18nLookup(const char* key) {
   if (key == nullptr) return nullptr;
   if (i18nTable.empty() && i18nLoadedFor.empty()) {
-    const std::string candidates[2] = {localeCode, std::string("en")};
-    for (const std::string& code : candidates) {
+    // zh-TW falls back to zh before en (contract section 8).
+    std::string codes[3] = {localeCode, std::string() , std::string("en")};
+    if (localeCode == "zh-TW") codes[1] = "zh";
+    for (const std::string& code : codes) {
       if (code.empty() || i18nTable.size() > 0) continue;
       const std::string path = appPathV + "lang/" + code + ".tsv";
       if (!Storage.exists(path.c_str())) continue;
@@ -2801,6 +2918,52 @@ void ScriptHost::onEnter() {
 }
 
 void ScriptHost::onLeave() { callHandler("on_leave"); }
+
+// --- ctx:after timers (2.x contract, section 2) -----------------------------
+int ScriptHost::addTimer(uint32_t delayMs, int funcRef) {
+  for (int i = 0; i < MAX_TIMERS; ++i) {
+    if (timers[i].ref < 0) {
+      timers[i].dueMs = millis() + delayMs;
+      timers[i].ref = funcRef;
+      return i;
+    }
+  }
+  return -1;
+}
+
+void ScriptHost::cancelTimer(int id) {
+  if (id < 0 || id >= MAX_TIMERS || timers[id].ref < 0) return;
+  if (L != nullptr) luaL_unref(L, LUA_REGISTRYINDEX, timers[id].ref);
+  timers[id].ref = -1;
+}
+
+bool ScriptHost::pumpTimers(uint32_t nowMillis) {
+  if (L == nullptr) return false;
+  bool ran = false;
+  for (int i = 0; i < MAX_TIMERS; ++i) {
+    if (timers[i].ref < 0) continue;
+    if (static_cast<int32_t>(nowMillis - timers[i].dueMs) < 0) continue;
+    const int ref = timers[i].ref;
+    // One-shot: the slot is freed BEFORE the call, so a callback that arms
+    // another timer cannot collide with the one it is running inside.
+    timers[i].ref = -1;
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
+    if (lua_isfunction(L, -1)) {
+      lua_getglobal(L, "ctx");
+      if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
+        const char* msg = lua_tostring(L, -1);
+        LOG_ERR("LUAHOST", " after(): %s", msg ? msg : "(no message)");
+        lastErrorV = msg ? msg : "after() error";
+        lua_pop(L, 1);
+      }
+      ran = true;
+    } else {
+      lua_pop(L, 1);
+    }
+    luaL_unref(L, LUA_REGISTRYINDEX, ref);
+  }
+  return ran;
+}
 
 // --- text metrics for the 2.x text options ---------------------------------
 int ScriptHost::textWidth(int fontId, const char* s) const {

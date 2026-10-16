@@ -89,12 +89,6 @@ class LuaAppActivity : public Activity {
     } else if (host != nullptr && host->loaded()) {
       host->onDraw();
     }
-    // DEBUG strip (remove when the Lua app pipeline is confirmed healthy):
-    // logical resolution + queued ops + the app dir actually being used.
-    char dbg[96];
-    snprintf(dbg, sizeof(dbg), "DBG %dx%d ops=%d %s", renderer.getScreenWidth(), renderer.getScreenHeight(),
-             host != nullptr ? host->gfx.operationCount() : -1, appName.c_str());
-    renderer.drawText(UI_10_FONT_ID, 8, top, dbg, true);
     if (host != nullptr) {
       const std::string& luaErr = host->lastError();
       if (!luaErr.empty()) {

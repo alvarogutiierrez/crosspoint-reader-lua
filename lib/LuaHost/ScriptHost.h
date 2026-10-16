@@ -184,6 +184,20 @@ class ScriptHost {
   void setTickIntervalMs(uint32_t ms) { tickIntervalMs = ms; }
   uint32_t tickMs() const { return tickIntervalMs; }
 
+  // --- ctx:after timers (2.x contract, section 2) ---------------------------
+  // At most 32 pending; the callback is kept in the registry and called with
+  // ctx. Pumped by the activity every loop iteration (not only when a tick
+  // interval is set), so a timer still fires with set_tick(0).
+  struct Timer {
+    uint32_t dueMs = 0;
+    int ref = -1;
+  };
+  static constexpr int MAX_TIMERS = 32;
+  Timer timers[MAX_TIMERS];
+  int addTimer(uint32_t delayMs, int funcRef);  // -1 when there is no free slot
+  void cancelTimer(int id);
+  bool pumpTimers(uint32_t nowMillis);
+
   // Anonymous `g` / ctx binding callbacks in ScriptHost.cpp manipulate this
   // queue directly.
   LuaGfx gfx;

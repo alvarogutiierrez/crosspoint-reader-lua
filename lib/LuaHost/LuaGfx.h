@@ -100,13 +100,19 @@ class LuaGfx {
     // enough for 480x800 and for layer ids). NOT for font ids: those are 32-bit
     // hashes from fontIds.h and truncating one makes drawText find no font and
     // drop the text silently — hence the dedicated field.
+    // For rects `e` packs the 2.x pair radius<<8 | line_width (both 0..255):
+    // the struct must NOT grow, because Sudoku fills the 3072-op queue and
+    // every extra byte per op is RAM the app cannot have back.
     int16_t a = 0, b = 0, c = 0, d = 0, e = 0;
     int32_t fontId = 0;  // Text only
-    // Rect only: 2.x opts.radius, the corner cut in px (0 = square corners).
-    int16_t radius = 0;
     uint8_t kind = 0;
     bool ink = true;
   };
+  // Guard the queue's memory: 3072 ops are a real app's frame (Sudoku), so the
+  // per-op size is a budget, not a detail. If a new field is needed, pack it
+  // into an existing one (radius<<8 | line_width) or the app loses RAM it was
+  // counting on.
+  static_assert(sizeof(Op) <= 32, "LuaGfx::Op must stay within 32 bytes");
 
   // Grows the queue on demand (capped at MAX_OPS); nullptr = queue full.
   Op* nextOp();

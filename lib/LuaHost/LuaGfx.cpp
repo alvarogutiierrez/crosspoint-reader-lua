@@ -157,8 +157,7 @@ bool LuaGfx::addRect(Kind kind, int x, int y, int w, int h, int lineWidth, bool 
   op.b = opGeom(y);
   op.c = opGeom(w);
   op.d = opGeom(h);
-  op.e = opGeom(lineWidth);
-  op.radius = opGeom(radius);
+  op.e = opGeom((radius > 0 ? (radius > 255 ? 255 : radius) : 0) * 256 + (lineWidth > 255 ? 255 : lineWidth));
   op.text = nullptr;
   ++opCount;
   return true;
@@ -374,7 +373,7 @@ void LuaGfx::applyRange(int from, int to) {
         const int w = op.c, h = op.d;
         if (w <= 0 || h <= 0) break;  // contract: w/h <= 0 draws nothing
         const int rmax = (w < h ? w : h) / 2;
-        int r = op.radius;
+        int r = (op.e >> 8) & 0xFF;  // radius<<8 | line_width (see Op::e)
         if (r < 0) r = 0;
         if (r > rmax) r = rmax;  // radius beyond half the short side is clamped
         if (kind == Kind::FillRect) {
@@ -384,7 +383,8 @@ void LuaGfx::applyRange(int from, int to) {
           }
           break;
         }
-        int lw = op.e > 0 ? op.e : 1;
+        int lw = op.e & 0xFF;
+        if (lw < 1) lw = 1;
         if (lw > w) lw = w;
         if (lw > h) lw = h;
         if (r == 0 && targetLayer < 0) {

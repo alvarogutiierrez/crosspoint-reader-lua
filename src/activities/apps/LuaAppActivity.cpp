@@ -63,9 +63,23 @@ bool LuaAppActivity::dispatchInput() {
     return true;
   }
   ev.isTouch = false;
-  // 2.x (section 4): every key press is a down/up PAIR with no auto-repeat. Back
-  // is handled in loop() (its pair is delivered on release, and only the up
-  // decides the exit), so it is deliberately not read here.
+  // Keys. A 2.x package gets the contract's down/up PAIR (section 4, no auto
+  // repeat). A 0.x/1.x package gets exactly the single event per press it always
+  // got: it does not read ev.phase, so a pair would make it act twice per press
+  // (the Sudoku acted twice on every button and then hung).
+  if (!host->api2x) {
+    ev.keyBack = mappedInput.wasPressed(MappedInputManager::Button::Back);
+    ev.keyOk = mappedInput.wasPressed(MappedInputManager::Button::Confirm);
+    ev.keyLeft = mappedInput.wasPressed(MappedInputManager::Button::Left);
+    ev.keyRight = mappedInput.wasPressed(MappedInputManager::Button::Right);
+    ev.keyUp = mappedInput.wasPressed(MappedInputManager::Button::Up);
+    ev.keyDown = mappedInput.wasPressed(MappedInputManager::Button::Down);
+    if (ev.keyBack || ev.keyOk || ev.keyLeft || ev.keyRight || ev.keyUp || ev.keyDown) {
+      host->onInput(ev);
+      return true;
+    }
+    return false;
+  }
   ev.phaseUp = false;
   ev.keyOk = mappedInput.wasPressed(MappedInputManager::Button::Confirm);
   ev.keyLeft = mappedInput.wasPressed(MappedInputManager::Button::Left);
@@ -119,35 +133,51 @@ void LuaAppActivity::loop() {
     return;
   }
 
-  // Back, per the contract (section 4): a SHORT press delivers the down and up
-  // pair when it is released and only the `up` return decides the exit; a LONG
-  // press (>= 1000 ms) is not delivered at all — it exits at once and the app
-  // cannot stop it. Delivering down on press would look equivalent for a
-  // well-behaved app, but the pair-at-release form is what the contract asks
-  // for, and it is what keeps one press from acting on two screens.
-  if (mappedInput.wasLongPressed(MappedInputManager::Button::Back, 1000)) {
-    backLongPress = true;
-    manager.popActivity();
-    return;
-  }
-  if (backLongPress && !mappedInput.isPressed(MappedInputManager::Button::Back)) {
-    backLongPress = false;  // the release that follows a long press is swallowed
-  }
-  if (!backLongPress && mappedInput.wasReleased(MappedInputManager::Button::Back)) {
-    LuaInputEvent down;
-    down.keyBack = true;
-    down.timeMs = now;
-    LuaInputEvent up = down;
-    up.phaseUp = true;
-    host->onInput(down);  // the down return value does not count
-    if (!host->onInput(up)) {
+  // Back. A 2.x package gets the contract's form (section 4): a SHORT press
+  // delivers the down and up pair when it is RELEASED and only the `up` return
+  // decides the exit, while a LONG press (>= 1000 ms) is not delivered at all
+  // and exits at once. A 0.x/1.x package keeps EXACTLY the old single event per
+  // press: it does not read ev.phase, so the pair would make it act twice —
+  // which is what a 0.8 app (the Sudoku) did on the build that shipped the pair
+  // to everyone.
+  if (!host->api2x) {
+    if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+      LuaInputEvent ev;
+      ev.keyBack = true;
+      ev.timeMs = now;
+      if (!host->onInput(ev)) {
+        manager.popActivity();
+        return;
+      }
+      lastInputMs = now;
+    }
+  } else {
+    if (mappedInput.wasLongPressed(MappedInputManager::Button::Back, 1000)) {
+      backLongPress = true;
       manager.popActivity();
       return;
     }
-    lastInputMs = now;
+    if (backLongPress && !mappedInput.isPressed(MappedInputManager::Button::Back)) {
+      backLongPress = false;  // the release that follows a long press is swallowed
+    }
+    if (!backLongPress && mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+      LuaInputEvent down;
+      down.keyBack = true;
+      down.timeMs = now;
+      LuaInputEvent up = down;
+      up.phaseUp = true;
+      host->onInput(down);  // the down return value does not count
+      if (!host->onInput(up)) {
+        manager.popActivity();
+        return;
+      }
+      lastInputMs = now;
+    }
   }
   if (dispatchInput()) lastInputMs = now;
   runTick(now);
+  // ctx:after timers fire every loop, with or without a set_tick interval.
+  if (host->pumpTimers(now) && host->wantsInvalidate()) lastInputMs = now;
 
   // One e-ink frame costs a whole waveform (hundreds of ms), so a burst of key
   // presses must collapse into ONE refresh instead of queueing one per press:
