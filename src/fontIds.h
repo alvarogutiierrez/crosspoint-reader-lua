@@ -18,7 +18,7 @@
 // constants), so Lua apps render with this instead of the (proportional,
 // 2x-taller) UI font: with UI_12 every label came out oversized and the
 // app's own centering math landed off-centre.
-#define APPMONO_10_FONT_ID (-128796587)
+#define APPMONO_10_FONT_ID (1945227282)
 
 // Font ID 0 is reserved as the "not found" sentinel.
 // Guard against any hash accidentally producing 0.
