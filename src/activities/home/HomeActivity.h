@@ -35,6 +35,21 @@ class HomeActivity final : public Activity {
   int coverRectW = 0;
   int coverRectH = 0;
   std::vector<RecentBook> recentBooks;
+  // --- first page: the cover flow of books started and not finished ---------
+  // It lives here, not in the cover-grid component: the grid only exists for
+  // ONE of the five themes, and this page is the home's first page whatever
+  // theme is selected. Down travels to the home below, which is untouched.
+  std::vector<RecentBook> flowBooks;
+  std::vector<int> flowPct;
+  int flowIndex = 0;
+  bool flowActive = true;
+  bool flowHasBooks() const { return !flowBooks.empty(); }
+  void buildFlow();
+  void flowMove(int delta);
+  const RecentBook* flowCurrent() const;
+  void drawFlow();
+  void drawFlowCover(const RecentBook& book, Rect rect, int thumbHeight, bool centre);
+  void roundCoverCorners(Rect rect, int radius);
   const HomeMenuItem initialMenuItem;
   const bool cleanInitialRefresh;
 

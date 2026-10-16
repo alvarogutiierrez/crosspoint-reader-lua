@@ -26,6 +26,7 @@
 #include "activities/plugins/PluginCatalogActivity.h"  // anyPluginInstalled()
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "util/BookProgress.h"
 
 int HomeActivity::getMenuItemCount() const {
   int count = 5;  // File Browser, Library, File transfer, Settings, Apps
@@ -245,10 +246,11 @@ void HomeActivity::onEnter() {
     fillCoverGridFromLibrary();
     resolveGridCoverPaths();
     coverGridUi->begin(recentBooks, hasLibrarySlot(), hasContinueReading);
-    // First page: the carousel of books started and not finished. Built here,
-    // on the main loop, because each entry costs an Epub metadata load.
-    coverGridUi->buildFlow();
   }
+  // The home's first page (the carousel) is built here, on the main loop: each
+  // unfinished entry costs one Epub metadata load, never to be done from the
+  // render task.
+  buildFlow();
 
   const auto base = static_cast<int>(recentBooks.size());
   selectorIndex = initialMenuItem == HomeMenuItem::NONE ? 0 : base + menuItemToIndex(initialMenuItem, hasLibrarySlot());
@@ -354,35 +356,35 @@ void HomeActivity::loop() {
 
   // First page: the cover flow of books started and not finished. It owns the
   // arrows and the horizontal swipe until the reader travels down to the home
-  // below — the wide chevron under the carousel is what says so.
-  if (coverGridUi && coverGridUi->isFlowPage()) {
+  // below — the wide chevron under the carousel is what says so. It is checked
+  // before the theme branches so it works with every theme.
+  if (flowActive && flowHasBooks()) {
     if (mappedInput.wasPressed(MappedInputManager::Button::Down) || swipe == MappedInputManager::SwipeDir::Up) {
-      coverGridUi->setPage(1);
+      flowActive = false;
       requestUpdate();
       return;
     }
     if (mappedInput.wasPressed(MappedInputManager::Button::Left) || swipe == MappedInputManager::SwipeDir::Right) {
-      coverGridUi->flowMove(-1);
+      flowMove(-1);
       requestUpdate();
       return;
     }
     if (mappedInput.wasPressed(MappedInputManager::Button::Right) || swipe == MappedInputManager::SwipeDir::Left) {
-      coverGridUi->flowMove(1);
+      flowMove(1);
       requestUpdate();
       return;
     }
-    const int touched = coverGridUi->selectedAction(mappedInput);
-    if (mappedInput.wasReleased(MappedInputManager::Button::Confirm) || touched >= 0) {
-      const RecentBook* flowBook = coverGridUi->flowCurrent();
+    if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+      const RecentBook* flowBook = flowCurrent();
       if (flowBook != nullptr) onSelectBook(flowBook->path);
       return;
     }
     // Nothing on this page consumed the event: fall through so Back still opens
     // the most recent book.
-  } else if (coverGridUi && coverGridUi->getPage() == 1 && coverGridUi->flowHasBooks() && selectorIndex == 0 &&
+  } else if (!flowActive && flowHasBooks() && selectorIndex == 0 &&
              (mappedInput.wasPressed(MappedInputManager::Button::Up) || swipe == MappedInputManager::SwipeDir::Down)) {
     // Travelling back up from the top of the home returns to the carousel.
-    coverGridUi->setPage(0);
+    flowActive = true;
     requestUpdate();
     return;
   }
@@ -512,6 +514,24 @@ void HomeActivity::render(RenderLock&&) {
   const Rect content = UITheme::getInstance().getContentArea(renderer);
 
   renderer.clearScreen();
+  // First page: the cover flow. A full screen of its own — the home below
+  // (header, cover tile, menu) is exactly what it always was. Checked before the
+  // theme branches so it shows whatever theme is selected.
+  if (flowActive && flowHasBooks()) {
+    drawFlow();
+    renderer.displayBuffer(cleanInitialRefresh && !firstRenderDone ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH);
+    if (!firstRenderDone) {
+      firstRenderDone = true;
+      requestUpdate();
+    } else if (!recentsLoaded && !recentsLoading) {
+      // The carousel draws the same thumbs the home's cover tile does; generate
+      // the missing ones once and let the next pass draw them.
+      recentsLoading = true;
+      const int themeThumb = GUI.homeCoverThumbHeight(renderer);
+      loadRecentCovers(themeThumb > 0 ? themeThumb : metrics.homeCoverHeight);
+    }
+    return;
+  }
   if (coverGridUi) {
     coverGridUi->setSelection(selectorIndex);
     UITheme::getInstance().drawCoverGridHome(*coverGridUi);
@@ -603,6 +623,150 @@ void HomeActivity::render(RenderLock&&) {
     const int themeThumbHeight = GUI.homeCoverThumbHeight(renderer);
     loadRecentCovers(themeThumbHeight > 0 ? themeThumbHeight : metrics.homeCoverHeight);
   }
+}
+
+// --- first page: the cover flow of books started and not finished ------------
+//
+// It lives in the activity and not in the cover-grid component: the grid only
+// exists for ONE of the five themes, and this page is meant to be the home's
+// first page whatever theme is selected. Its chevron travels down to the home
+// below, which is untouched.
+
+void HomeActivity::buildFlow() {
+  flowBooks.clear();
+  flowPct.clear();
+  flowIndex = 0;
+  flowActive = true;
+  // "Started and not finished": every recents entry the reader has not finished
+  // (100%). A progress of -1 means the saved position could not be read (an
+  // older cache, or an XTC with no progress yet) and still counts as unfinished
+  // — a recents entry only exists for a book that was opened at some point.
+  for (const RecentBook& book : recentBooks) {
+    const int pct = loadBookProgress(book.path);
+    if (pct >= 100) continue;
+    flowBooks.push_back(book);
+    flowPct.push_back(pct);
+  }
+  LOG_INF("HOME", "cover flow: %u of %u recents unfinished", static_cast<unsigned>(flowBooks.size()),
+          static_cast<unsigned>(recentBooks.size()));
+}
+
+void HomeActivity::flowMove(const int delta) {
+  const int n = static_cast<int>(flowBooks.size());
+  if (n <= 0) return;
+  flowIndex = std::max(0, std::min(n - 1, flowIndex + delta));
+}
+
+const RecentBook* HomeActivity::flowCurrent() const {
+  if (flowIndex < 0 || flowIndex >= static_cast<int>(flowBooks.size())) return nullptr;
+  return &flowBooks[flowIndex];
+}
+
+void HomeActivity::drawFlowCover(const RecentBook& book, const Rect rect, const int thumbHeight, const bool centre) {
+  // Shadow, then the thumb: same source and size as the home's own cover tile,
+  // so the thumbs are generated once and reused by both pages.
+  const int off = centre ? 3 : 2;
+  renderer.drawRect(rect.x + rect.width, rect.y + off, off, rect.height, true);
+  renderer.drawRect(rect.x + off, rect.y + rect.height, rect.width, off, true);
+
+  bool drawn = false;
+  const std::string thumb = UITheme::getCoverThumbPath(book.coverBmpPath, thumbHeight);
+  if (!thumb.empty()) {
+    HalFile file;
+    if (Storage.openFileForRead("HOME", thumb, file)) {
+      Bitmap bitmap(file);
+      if (bitmap.parseHeaders() == BmpReaderError::Ok) {
+        drawn = GUI.drawCoverThumbFill(renderer, bitmap, rect);
+      }
+      file.close();
+    }
+  }
+  if (!drawn) GUI.drawCoverPlaceholder(renderer, rect);
+  renderer.drawRect(rect.x, rect.y, rect.width, rect.height, 1, true);
+  if (centre) roundCoverCorners(rect, 10);
+}
+
+void HomeActivity::roundCoverCorners(const Rect rect, const int radius) {
+  if (radius <= 0 || rect.width < 2 * radius || rect.height < 2 * radius) return;
+  const int x0 = rect.x, y0 = rect.y;
+  const int x1 = rect.x + rect.width - 1, y1 = rect.y + rect.height - 1;
+  // The four corner pockets that fall outside the rounded shape...
+  for (int dy = 0; dy < radius; ++dy) {
+    for (int dx = 0; dx < radius; ++dx) {
+      const double ddx = radius - dx - 0.5;
+      const double ddy = radius - dy - 0.5;
+      if (ddx * ddx + ddy * ddy <= static_cast<double>(radius) * radius) continue;
+      renderer.drawPixel(x0 + dx, y0 + dy, false);
+      renderer.drawPixel(x1 - dx, y0 + dy, false);
+      renderer.drawPixel(x0 + dx, y1 - dy, false);
+      renderer.drawPixel(x1 - dx, y1 - dy, false);
+    }
+  }
+  // ...then the arc that is left, so the cover reads as a card.
+  const double rr = radius - 1.0;
+  for (int a = 0; a <= 90; ++a) {
+    const double rad = a * 3.14159265358979 / 180.0;
+    const int offx = static_cast<int>(radius - 0.5 - rr * std::cos(rad) + 0.5);
+    const int offy = static_cast<int>(radius - 0.5 - rr * std::sin(rad) + 0.5);
+    renderer.drawPixel(x0 + offx, y0 + offy, true);
+    renderer.drawPixel(x1 - offx, y0 + offy, true);
+    renderer.drawPixel(x0 + offx, y1 - offy, true);
+    renderer.drawPixel(x1 - offx, y1 - offy, true);
+  }
+}
+
+void HomeActivity::drawFlow() {
+  if (flowBooks.empty()) return;
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  const Rect content = UITheme::getInstance().getContentArea(renderer);
+  const int pageWidth = renderer.getScreenWidth();
+  if (flowIndex >= static_cast<int>(flowBooks.size())) flowIndex = static_cast<int>(flowBooks.size()) - 1;
+  if (flowIndex < 0) flowIndex = 0;
+  const RecentBook& book = flowBooks[flowIndex];
+
+  // The same status band as every other screen, so the chrome never moves; the
+  // title of the book being shown rides in it.
+  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.homeTopPadding - metrics.topPadding},
+                 book.title.c_str(), nullptr, false);
+
+  const int themeThumbHeight = GUI.homeCoverThumbHeight(renderer);
+  const int thumbHeight = themeThumbHeight > 0 ? themeThumbHeight : metrics.homeCoverHeight;
+  const int coverW = std::max(1, thumbHeight * 2 / 3);
+  const int titleY = metrics.homeTopPadding + 8;
+  renderer.drawCenteredText(UI_12_FONT_ID, titleY, book.title.c_str());
+  const int cy = titleY + 30;
+  const int cx = content.x + (content.width - coverW) / 2;
+  const int n = static_cast<int>(flowBooks.size());
+
+  // Carousel. The neighbours draw at the SAME size as the centre cover: one
+  // thumb size means one set of generated covers, and rescaling a dithered
+  // 1-bit cover aliases badly. They are half off the panel by design.
+  if (flowIndex > 0) drawFlowCover(flowBooks[flowIndex - 1], Rect{cx - coverW - 12, cy, coverW, thumbHeight},
+                                  thumbHeight, false);
+  if (flowIndex + 1 < n) {
+    drawFlowCover(flowBooks[flowIndex + 1], Rect{cx + coverW + 12, cy, coverW, thumbHeight}, thumbHeight, false);
+  }
+  drawFlowCover(book, Rect{cx, cy, coverW, thumbHeight}, thumbHeight, true);
+
+  // Read percentage, when the firmware knows it, then the chevron: a WIDE
+  // two-stroke ∨, no shaft and no filled triangle, wider than the footer
+  // page-turn arrows, pointing at the home below.
+  if (flowPct[flowIndex] >= 0) {
+    char pctText[16];
+    snprintf(pctText, sizeof(pctText), "%d%%", flowPct[flowIndex]);
+    renderer.drawCenteredText(UI_10_FONT_ID, cy + thumbHeight + 14, pctText);
+  }
+  const int chevY = cy + thumbHeight + 44;
+  const int halfSpan = std::min(110, content.width / 4);
+  const int drop = halfSpan * 2 / 3;
+  const int midX = content.x + content.width / 2;
+  if (chevY + drop + 8 < renderer.getScreenHeight() - metrics.buttonHintsHeight) {
+    renderer.drawLine(midX - halfSpan, chevY, midX, chevY + drop, 2, true);
+    renderer.drawLine(midX, chevY + drop, midX + halfSpan, chevY, 2, true);
+  }
+
+  const auto labels = mappedInput.mapLabels(tr(STR_RESUME), tr(STR_SELECT), tr(STR_DIR_LEFT), tr(STR_DIR_RIGHT));
+  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 }
 
 void HomeActivity::onSelectBook(const std::string& path) { activityManager.goToReader(path); }
