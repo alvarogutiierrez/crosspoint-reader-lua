@@ -575,3 +575,6 @@ STR_CLIP: "Clip"
 STR_CLIPPING_TOO_LONG: "Selection Too Long — Select Less Text"
 STR_CLIPPING_EXPORT_FAILED: "Clipping Saved — Text Export Failed"
 STR_GO_TO_PASSAGE: "Go to Passage"
+
+STR_APPS: "Apps"
+STR_NO_LUA_APPS: "No Lua Apps"

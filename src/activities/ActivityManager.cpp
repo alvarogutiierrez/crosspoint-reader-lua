@@ -24,6 +24,8 @@
 #include "network/CrossPointWebServerActivity.h"
 #include "network/UsbDriveActivity.h"
 #include "plugins/PluginCatalogActivity.h"
+#include "apps/LuaAppsActivity.h"
+#include "apps/LuaAppActivity.h"
 #include "reader/ReaderActivity.h"
 #include "settings/OpdsServerListActivity.h"
 #include "settings/SettingsActivity.h"
@@ -272,6 +274,24 @@ void ActivityManager::goToUsbDrive() {
 }
 
 void ActivityManager::goToSettings() { replaceActivity(std::make_unique<SettingsActivity>(renderer, mappedInput)); }
+
+void ActivityManager::goToApps() {
+  auto activity = makeUniqueNoThrow<LuaAppsActivity>(*this, renderer, mappedInput);
+  if (!activity) {
+    LOG_ERR("ACT", "OOM: apps activity");
+    return;
+  }
+  replaceActivity(std::move(activity));
+}
+
+void ActivityManager::goToApp(std::string appName) {
+  auto activity = makeUniqueNoThrow<LuaAppActivity>(*this, renderer, mappedInput, std::move(appName));
+  if (!activity) {
+    LOG_ERR("ACT", "OOM: lua app activity");
+    return;
+  }
+  pushActivity(std::move(activity));
+}
 
 void ActivityManager::goToFileBrowser(std::string path) {
   replaceActivity(std::make_unique<FileBrowserActivity>(renderer, mappedInput, std::move(path)));
