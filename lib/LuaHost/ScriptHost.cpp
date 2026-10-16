@@ -5,12 +5,12 @@
 #include <GfxRenderer.h>
 #include <Logging.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
 #include "HalStorage.h"
-
-#include <NetworkClient.h>
 
 #include <NetworkClient.h>
 
@@ -132,6 +132,68 @@ static const char* gfxImageKey(lua_State* L, int idx) {
   return lua_isstring(L, idx) ? lua_tostring(L, idx) : nullptr;
 }
 
+// --- 2.x options tables (contract api-2.1.3, sections 6-7) ------------------
+//
+// 2.x passes ONE OPTIONS TABLE where 0.8 passed positional colour/mode
+// arguments. Both shapes are accepted by the same binding: when the slot 0.8
+// uses for the mode/colour holds a table, the 2.x rules apply. Nothing here
+// forks the API on the manifest version — an app gets the semantics of the
+// shape it actually wrote.
+struct GfxStyle {
+  bool fill = false;
+  int radius = 0;
+  int lineWidth = 1;
+  float color = 15.0f;
+};
+
+static GfxStyle gfxStyleTable(lua_State* L, int idx) {
+  GfxStyle o;
+  if (!lua_istable(L, idx)) return o;
+  lua_getfield(L, idx, "fill");
+  if (lua_isboolean(L, -1)) o.fill = lua_toboolean(L, -1) != 0;
+  lua_pop(L, 1);
+  lua_getfield(L, idx, "radius");
+  if (lua_isnumber(L, -1)) o.radius = static_cast<int>(lua_tointeger(L, -1));
+  lua_pop(L, 1);
+  lua_getfield(L, idx, "line_width");
+  if (lua_isnumber(L, -1)) o.lineWidth = static_cast<int>(lua_tointeger(L, -1));
+  lua_pop(L, 1);
+  lua_getfield(L, idx, "color");
+  if (lua_isnumber(L, -1)) o.color = static_cast<float>(lua_tonumber(L, -1));
+  lua_pop(L, 1);
+  if (o.radius < 0) o.radius = 0;  // contract: radius 0..255
+  if (o.radius > 255) o.radius = 255;
+  if (o.lineWidth < 1) o.lineWidth = 1;  // contract: line_width 1..255
+  if (o.lineWidth > 255) o.lineWidth = 255;
+  return o;
+}
+
+// opts.font: a ctx.fonts entry (table carrying `id`) or a raw font id. 0 means
+// "no font requested" and the caller keeps its default.
+static int gfxFontField(lua_State* L, int idx) {
+  if (!lua_istable(L, idx)) return 0;
+  lua_getfield(L, idx, "font");
+  int id = 0;
+  if (lua_istable(L, -1)) {
+    lua_getfield(L, -1, "id");
+    if (lua_isnumber(L, -1)) id = static_cast<int>(lua_tointeger(L, -1));
+    lua_pop(L, 1);
+  } else if (lua_isnumber(L, -1)) {
+    id = static_cast<int>(lua_tointeger(L, -1));
+  }
+  lua_pop(L, 1);
+  return id;
+}
+
+// A text-option string field ("center", "middle", ...). The returned pointer is
+// owned by the table at `idx`, which the caller keeps on the stack.
+static const char* gfxStrField(lua_State* L, int idx, const char* key) {
+  if (!lua_istable(L, idx)) return nullptr;
+  lua_getfield(L, idx, key);
+  const char* v = lua_isstring(L, -1) ? lua_tostring(L, -1) : nullptr;
+  return v;
+}
+
 int g_clear(lua_State* L) {
   ScriptHost* host = hostOf(L);
   const int base = gfxArgBase(L);
@@ -142,18 +204,51 @@ int g_clear(lua_State* L) {
 int g_text(lua_State* L) {
   ScriptHost* host = hostOf(L);
   const int base = gfxArgBase(L);
-  // XTApp signature: g:text(x, y, str[, {color = level}])
+  // 0.8: g:text(x, y, str[, color])
+  // 2.x: g:text(x, y, str, {color, align, valign, font}) — (x, y) anchors the
+  // LINE BOX (measure wide, line_height tall, baseline `ascent` below its top),
+  // so align/valign shift the anchor before queueing. The contract aligns the
+  // box, not the ink, which is why two different strings in one font share a
+  // baseline.
   int x = static_cast<int>(luaL_checkinteger(L, base));
   int y = static_cast<int>(luaL_checkinteger(L, base + 1));
   const char* s = luaL_checkstring(L, base + 2);
-  const float color = gfxColorArg(L, base + 3, 15.0f);  // default: black
+  int fontId = host->defaultFontId;
+  float color = 15.0f;  // default: black
+  if (lua_istable(L, base + 3)) {
+    color = gfxColorArg(L, base + 3, 15.0f);
+    const int optFont = gfxFontField(L, base + 3);
+    if (optFont != 0) fontId = optFont;
+    const char* align = gfxStrField(L, base + 3, "align");
+    if (align != nullptr && (strcmp(align, "center") == 0 || strcmp(align, "right") == 0)) {
+      const int tw = host->textWidth(fontId, s);
+      if (strcmp(align, "center") == 0) {
+        x -= tw / 2;
+      } else {
+        x -= tw;
+      }
+    }
+    // "justify" is a multi-line alignment; the contract has g:text treat it as left.
+    const char* valign = gfxStrField(L, base + 3, "valign");
+    if (valign != nullptr) {
+      if (strcmp(valign, "middle") == 0) {
+        y -= host->lineHeightOf(fontId) / 2;
+      } else if (strcmp(valign, "baseline") == 0) {
+        y -= host->ascenderOf(fontId);
+      } else if (strcmp(valign, "bottom") == 0) {
+        y -= host->lineHeightOf(fontId);
+      }
+    }
+  } else {
+    color = gfxColorArg(L, base + 3, 15.0f);
+  }
   // Text queueing needs a font that exists in the renderer's font map; without
   // one drawText() logs "Font N not found" and draws nothing.
-  if (host->defaultFontId == 0) {
+  if (fontId == 0) {
     LOG_ERR("LUAHOST", "g:text called with no default font set; text dropped");
     return 0;
   }
-  host->gfx.addText(host->defaultFontId, x, y, s, gfxInk(color));
+  host->gfx.addText(fontId, x, y, s, gfxInk(color));
   return 0;
 }
 
@@ -165,6 +260,14 @@ int g_rect(lua_State* L) {
   int y = static_cast<int>(luaL_checkinteger(L, base + 1));
   int w = static_cast<int>(luaL_checkinteger(L, base + 2));
   int h = static_cast<int>(luaL_checkinteger(L, base + 3));
+  // 2.x: {fill, radius, line_width, color}. The stroke grows inward and the
+  // radius clamps to half the short side (handled in the rasterizer).
+  if (lua_istable(L, base + 4)) {
+    const GfxStyle o = gfxStyleTable(L, base + 4);
+    host->gfx.addRect(o.fill ? LuaGfx::Kind::FillRect : LuaGfx::Kind::DrawRect, x, y, w, h, o.lineWidth,
+                      gfxInk(o.color), o.radius);
+    return 0;
+  }
   const char* mode = "stroke";
   if (lua_isstring(L, base + 4)) mode = lua_tostring(L, base + 4);
   const int colorIdx = lua_isstring(L, base + 4) ? base + 5 : base + 4;
@@ -183,6 +286,13 @@ int g_line(lua_State* L) {
   int y1 = static_cast<int>(luaL_checkinteger(L, base + 1));
   int x2 = static_cast<int>(luaL_checkinteger(L, base + 2));
   int y2 = static_cast<int>(luaL_checkinteger(L, base + 3));
+  // 2.x: {color, line_width}. line_width 1 is Bresenham (both ends drawn);
+  // thicker lines cover the pixels nearer than line_width / 2 to the segment.
+  if (lua_istable(L, base + 4)) {
+    const GfxStyle o = gfxStyleTable(L, base + 4);
+    host->gfx.addLine(x1, y1, x2, y2, gfxInk(o.color), o.lineWidth);
+    return 0;
+  }
   host->gfx.addLine(x1, y1, x2, y2, gfxInk(gfxColorArg(L, base + 4, 15.0f)));
   return 0;
 }
@@ -194,6 +304,13 @@ int g_circle(lua_State* L) {
   int cx = static_cast<int>(luaL_checkinteger(L, base));
   int cy = static_cast<int>(luaL_checkinteger(L, base + 1));
   int r = static_cast<int>(luaL_checkinteger(L, base + 2));
+  // 2.x: {fill, line_width, color}.
+  if (lua_istable(L, base + 3)) {
+    const GfxStyle o = gfxStyleTable(L, base + 3);
+    host->gfx.addCircle(o.fill ? LuaGfx::Kind::FillCircle : LuaGfx::Kind::DrawCircle, cx, cy, r,
+                        gfxInk(o.color), o.lineWidth);
+    return 0;
+  }
   const char* mode = "stroke";
   if (lua_isstring(L, base + 3)) mode = lua_tostring(L, base + 3);
   const int colorIdx2 = lua_isstring(L, base + 3) ? base + 4 : base + 3;
@@ -972,6 +1089,419 @@ const luaL_Reg lockFuncs[] = {
 const luaL_Reg assetsFuncs[] = {
     {"evict", assets_evict}, {"info", assets_info}, {"handle", assets_handle}, {nullptr, nullptr},
 };
+// --- ctx.storage / ctx.json (2.x contract, sections 9-10) -------------------
+// (appendJsonString lives with the state writer further down.)
+void appendJsonString(std::string& out, const char* s, size_t len);
+
+// 2.x apps do NOT persist through ctx.state: they keep session state in module
+// locals and write it with ctx.json:encode + ctx.storage:write. The 0.8
+// ctx.data namespace stays for 0.8 apps; these are the 2.x names over the same
+// private per-app directory.
+constexpr size_t STORAGE_MAX_FILE = 262144;      // 256 KB per file
+constexpr size_t STORAGE_MAX_FILES = 512;
+constexpr size_t STORAGE_MAX_TOTAL = 134217728;  // 128 MB per app
+constexpr size_t JSON_MAX_OUTPUT = 262144;
+constexpr int JSON_MAX_DEPTH = 32;
+constexpr const char* kJsonNullRegistry = "x4_json_null";
+constexpr const char* kStoragePrefix = "storage/";
+
+// name: 1..64 bytes of [a-z0-9._-], no leading or trailing '.'. The trailing
+// rule is also what keeps "<name>.tmp" from ever colliding with a real file.
+static bool storageNameOk(const char* name) {
+  if (name == nullptr) return false;
+  const size_t n = strlen(name);
+  if (n == 0 || n > 64) return false;
+  if (name[0] == '.' || name[n - 1] == '.') return false;
+  for (size_t i = 0; i < n; ++i) {
+    const char c = name[i];
+    const bool ok =
+        (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+    if (!ok) return false;
+  }
+  return true;
+}
+
+static std::string storageDirOf(const ScriptHost* host) { return host->appPath() + kStoragePrefix; }
+
+// ctx.storage:read(...) — methods are called with the table as arg 1.
+static int storageArgBase(lua_State* L) { return lua_type(L, 1) == LUA_TTABLE ? 2 : 1; }
+
+// Files + total bytes in use, optionally collecting the names.
+static size_t storageScan(const ScriptHost* host, std::vector<std::string>* names) {
+  size_t total = 0;
+  HalFile dir = Storage.open(storageDirOf(host).c_str());
+  if (!dir.isOpen() || !dir.isDirectory()) return 0;
+  for (HalFile f = dir.openNextFile(); f; f = dir.openNextFile()) {
+    if (f.isDirectory()) continue;
+    char nm[80];
+    const size_t n = f.getName(nm, sizeof(nm));
+    if (names != nullptr && n > 0) names->push_back(std::string(nm, n));
+    total += static_cast<size_t>(f.fileSize());
+  }
+  return total;
+}
+
+int storage_read(lua_State* L) {
+  ScriptHost* host = hostOf(L);
+  const char* name = luaL_checkstring(L, storageArgBase(L));
+  if (host == nullptr || !storageNameOk(name)) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "invalid_argument");
+    return 2;
+  }
+  const std::string path = storageDirOf(host) + name;
+  if (!Storage.exists(path.c_str())) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "not_found");
+    return 2;
+  }
+  String content = Storage.readFile(path.c_str());
+  lua_pushlstring(L, content.c_str(), content.length());
+  return 1;
+}
+
+int storage_write(lua_State* L) {
+  ScriptHost* host = hostOf(L);
+  const int base = storageArgBase(L);
+  const char* name = luaL_checkstring(L, base);
+  size_t len = 0;
+  const char* data = luaL_checklstring(L, base + 1, &len);
+  if (host == nullptr || !storageNameOk(name)) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "invalid_argument");
+    return 2;
+  }
+  if (len > STORAGE_MAX_FILE) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "limit_exceeded");
+    return 2;
+  }
+  const std::string dir = storageDirOf(host);
+  const std::string path = dir + name;
+  const bool existed = Storage.exists(path.c_str());
+  std::vector<std::string> names;
+  size_t files = 0;
+  const size_t total = storageScan(host, &names);
+  files = names.size();
+  size_t prev = 0;
+  if (existed) {
+    HalFile old = Storage.open(path.c_str());
+    if (old.isOpen()) {
+      prev = static_cast<size_t>(old.fileSize());
+      old.close();
+    }
+  }
+  if (!existed && files + 1 > STORAGE_MAX_FILES) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "limit_exceeded");
+    return 2;
+  }
+  if (total - prev + len > STORAGE_MAX_TOTAL) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "limit_exceeded");
+    return 2;
+  }
+  if (!Storage.exists(dir.c_str())) Storage.mkdir(dir.c_str());
+  // Atomic: write the temp file, then rename over the target, so a power cut
+  // leaves either the old or the new content, never half of either.
+  const std::string tmp = path + ".tmp";
+  HalFile f;
+  if (!Storage.openFileForWrite("LUAHOST", tmp, f)) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "io_error");
+    return 2;
+  }
+  const size_t written = (len > 0) ? f.write(reinterpret_cast<const uint8_t*>(data), len) : 0;
+  f.flush();
+  f.close();
+  if (written != len || !Storage.rename(tmp.c_str(), path.c_str())) {
+    Storage.remove(tmp.c_str());
+    lua_pushnil(L);
+    lua_pushliteral(L, "io_error");
+    return 2;
+  }
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+int storage_remove(lua_State* L) {
+  ScriptHost* host = hostOf(L);
+  const char* name = luaL_checkstring(L, storageArgBase(L));
+  if (host == nullptr || !storageNameOk(name)) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "invalid_argument");
+    return 2;
+  }
+  const std::string path = storageDirOf(host) + name;
+  if (Storage.exists(path.c_str()) && !Storage.remove(path.c_str())) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "io_error");
+    return 2;
+  }
+  lua_pushboolean(L, 1);  // removing a file that is not there is a success
+  return 1;
+}
+
+int storage_exists(lua_State* L) {
+  ScriptHost* host = hostOf(L);
+  const char* name = luaL_checkstring(L, storageArgBase(L));
+  if (host == nullptr || !storageNameOk(name)) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+  lua_pushboolean(L, Storage.exists((storageDirOf(host) + name).c_str()) ? 1 : 0);
+  return 1;
+}
+
+int storage_size(lua_State* L) {
+  ScriptHost* host = hostOf(L);
+  const char* name = luaL_checkstring(L, storageArgBase(L));
+  if (host == nullptr || !storageNameOk(name)) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "invalid_argument");
+    return 2;
+  }
+  HalFile f = Storage.open((storageDirOf(host) + name).c_str());
+  if (!f.isOpen()) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "not_found");
+    return 2;
+  }
+  const lua_Integer size = static_cast<lua_Integer>(f.fileSize());
+  f.close();
+  lua_pushinteger(L, size);
+  return 1;
+}
+
+int storage_list(lua_State* L) {
+  ScriptHost* host = hostOf(L);
+  std::vector<std::string> names;
+  if (host != nullptr) storageScan(host, &names);
+  std::sort(names.begin(), names.end());  // byte order, as the contract asks
+  lua_createtable(L, static_cast<int>(names.size()), 0);
+  int i = 1;
+  for (const std::string& n : names) {
+    lua_pushlstring(L, n.c_str(), n.size());
+    lua_rawseti(L, -2, i++);
+  }
+  return 1;
+}
+
+int storage_usage(lua_State* L) {
+  ScriptHost* host = hostOf(L);
+  std::vector<std::string> names;
+  const size_t bytes = host != nullptr ? storageScan(host, &names) : 0;
+  lua_createtable(L, 0, 4);
+  lua_pushinteger(L, static_cast<lua_Integer>(names.size()));
+  lua_setfield(L, -2, "files");
+  lua_pushinteger(L, static_cast<lua_Integer>(bytes));
+  lua_setfield(L, -2, "bytes");
+  lua_pushinteger(L, static_cast<lua_Integer>(STORAGE_MAX_FILES));
+  lua_setfield(L, -2, "max_files");
+  lua_pushinteger(L, static_cast<lua_Integer>(STORAGE_MAX_TOTAL));
+  lua_setfield(L, -2, "max_bytes");
+  return 1;
+}
+
+// ctx.json.null: one shared table so `v == ctx.json.null` is a plain compare.
+static void pushJsonNull(lua_State* L) {
+  lua_getfield(L, LUA_REGISTRYINDEX, kJsonNullRegistry);
+  if (lua_istable(L, -1)) return;
+  lua_pop(L, 1);
+  lua_newtable(L);
+  lua_pushliteral(L, "null");
+  lua_setfield(L, -2, "__json");
+  lua_pushvalue(L, -1);
+  lua_setfield(L, LUA_REGISTRYINDEX, kJsonNullRegistry);
+}
+
+static bool isJsonNull(lua_State* L, int idx) {
+  lua_getfield(L, LUA_REGISTRYINDEX, kJsonNullRegistry);
+  const bool same = lua_istable(L, -1) && lua_rawequal(L, idx, -1) != 0;
+  lua_pop(L, 1);
+  return same;
+}
+
+static bool jsonEncodeValue(lua_State* L, int idx, std::string& out, int depth) {
+  if (depth > JSON_MAX_DEPTH || out.size() > JSON_MAX_OUTPUT) return false;
+  const int abs = lua_absindex(L, idx);
+  switch (lua_type(L, abs)) {
+    case LUA_TNIL:
+      out += "null";
+      return true;
+    case LUA_TBOOLEAN:
+      out += lua_toboolean(L, abs) ? "true" : "false";
+      return true;
+    case LUA_TNUMBER: {
+      char buf[40];
+      if (lua_isinteger(L, abs)) {
+        snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(lua_tointeger(L, abs)));
+      } else {
+        const double d = lua_tonumber(L, abs);
+        if (!isfinite(d)) return false;  // NaN / inf are invalid_argument
+        snprintf(buf, sizeof(buf), "%.9g", d);
+      }
+      out += buf;
+      return true;
+    }
+    case LUA_TSTRING: {
+      size_t len = 0;
+      const char* s = lua_tolstring(L, abs, &len);
+      appendJsonString(out, s, len);
+      return true;
+    }
+    case LUA_TTABLE:
+      break;
+    default:
+      return false;  // functions, coroutines, userdata, ...
+  }
+  if (isJsonNull(L, abs)) {
+    out += "null";
+    return true;
+  }
+  // Arrays are tables whose keys are exactly 1..n; objects have string keys;
+  // anything else is invalid_argument (contract section 10).
+  std::vector<lua_Integer> ints;
+  std::vector<std::string> keys;
+  bool hasStringKey = false;
+  lua_pushnil(L);
+  while (lua_next(L, abs) != 0) {
+    if (lua_type(L, -2) == LUA_TSTRING) {
+      size_t klen = 0;
+      const char* k = lua_tolstring(L, -2, &klen);
+      keys.push_back(std::string(k, klen));
+      hasStringKey = true;
+    } else if (lua_isinteger(L, -2)) {
+      ints.push_back(lua_tointeger(L, -2));
+    } else {
+      lua_pop(L, 2);
+      return false;
+    }
+    lua_pop(L, 1);
+  }
+  if (!hasStringKey) {
+    bool array = true;
+    for (size_t i = 0; i < ints.size() && array; ++i) {
+      bool found = false;
+      for (size_t j = 0; j < ints.size(); ++j) {
+        if (ints[j] == static_cast<lua_Integer>(i + 1)) found = true;
+      }
+      if (!found) array = false;
+    }
+    if (array) {
+      out += '[';
+      const int n = static_cast<int>(ints.size());
+      for (int i = 1; i <= n; ++i) {
+        if (i > 1) out += ',';
+        lua_rawgeti(L, abs, i);
+        const bool ok = jsonEncodeValue(L, -1, out, depth + 1);
+        lua_pop(L, 1);
+        if (!ok) return false;
+      }
+      out += ']';
+      return true;
+    }
+    if (!ints.empty()) return false;  // integer keys that are not 1..n
+  }
+  if (ints.size() > 0 && hasStringKey) return false;  // mixed keys
+  std::sort(keys.begin(), keys.end());
+  out += '{';
+  for (size_t i = 0; i < keys.size(); ++i) {
+    if (i > 0) out += ',';
+    appendJsonString(out, keys[i].c_str(), keys[i].size());
+    out += ':';
+    lua_pushlstring(L, keys[i].c_str(), keys[i].size());
+    lua_gettable(L, abs);
+    const bool ok = jsonEncodeValue(L, -1, out, depth + 1);
+    lua_pop(L, 1);
+    if (!ok) return false;
+  }
+  out += '}';
+  return true;
+}
+
+int json_encode(lua_State* L) {
+  const int base = lua_type(L, 1) == LUA_TTABLE ? 2 : 1;  // ctx.json:encode(v)
+  if (lua_isnoneornil(L, base)) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "invalid_argument");
+    return 2;
+  }
+  std::string out;
+  out.reserve(256);
+  if (!jsonEncodeValue(L, base, out, 0)) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "invalid_argument");
+    return 2;
+  }
+  if (out.size() > JSON_MAX_OUTPUT) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "limit_exceeded");
+    return 2;
+  }
+  lua_pushlstring(L, out.c_str(), out.size());
+  return 1;
+}
+
+// decode: like restoreStateValue, except null becomes the ctx.json.null object
+// and out-of-range nesting is invalid_argument.
+void pushJsonValue(lua_State* L, JsonVariantConst v, int depth) {
+  if (depth > JSON_MAX_DEPTH) {
+    lua_pushnil(L);
+    return;
+  }
+  if (v.is<JsonObjectConst>()) {
+    lua_newtable(L);
+    for (JsonPairConst kv : v.as<JsonObjectConst>()) {
+      pushJsonValue(L, kv.value(), depth + 1);
+      lua_setfield(L, -2, kv.key().c_str());
+    }
+  } else if (v.is<JsonArrayConst>()) {
+    lua_newtable(L);
+    int i = 1;
+    for (JsonVariantConst e : v.as<JsonArrayConst>()) {
+      pushJsonValue(L, e, depth + 1);
+      lua_rawseti(L, -2, i++);
+    }
+  } else if (v.is<const char*>()) {
+    lua_pushstring(L, v.as<const char*>());
+  } else if (v.is<bool>()) {
+    lua_pushboolean(L, v.as<bool>());
+  } else if (v.is<long long>()) {
+    lua_pushinteger(L, static_cast<lua_Integer>(v.as<long long>()));
+  } else if (v.is<double>()) {
+    lua_pushnumber(L, v.as<double>());
+  } else {
+    pushJsonNull(L);  // JSON null
+  }
+}
+
+int json_decode(lua_State* L) {
+  const int base = lua_type(L, 1) == LUA_TTABLE ? 2 : 1;
+  size_t len = 0;
+  const char* s = luaL_checklstring(L, base, &len);
+  JsonDocument doc;
+  const DeserializationError err = deserializeJson(doc, s, len);
+  if (err) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "invalid_argument");
+    return 2;
+  }
+  pushJsonValue(L, doc.as<JsonVariantConst>(), 0);
+  return 1;
+}
+
+const luaL_Reg storageFuncs[] = {
+    {"read", storage_read},     {"write", storage_write}, {"remove", storage_remove},
+    {"exists", storage_exists}, {"size", storage_size},   {"list", storage_list},
+    {"usage", storage_usage},   {nullptr, nullptr},
+};
+const luaL_Reg jsonFuncs[] = {
+    {"encode", json_encode},
+    {"decode", json_decode},
+    {nullptr, nullptr},
+};
+
 const luaL_Reg dataFuncs[] = {
     {"exists", data_exists},   {"size", data_size},       {"read_text", data_read_text},
     {"open_text", data_open_text}, {nullptr, nullptr},
@@ -1927,6 +2457,21 @@ bool ScriptHost::load(const std::string& name) {
   lua_setfield(L, -2, "short_side");
   lua_pushinteger(L, sw < sh ? sh : sw);
   lua_setfield(L, -2, "long_side");
+  // 2.x (section 3): occlusion is the band the shell covers over the app (zero
+  // on both X4 profiles — the app frame is the whole panel) and gray_levels is
+  // what an app's fast-refresh frame actually shows (2: 0..7 paper, 8..15 ink).
+  lua_createtable(L, 0, 4);
+  lua_pushinteger(L, 0);
+  lua_setfield(L, -2, "top");
+  lua_pushinteger(L, 0);
+  lua_setfield(L, -2, "right");
+  lua_pushinteger(L, 0);
+  lua_setfield(L, -2, "bottom");
+  lua_pushinteger(L, 0);
+  lua_setfield(L, -2, "left");
+  lua_setfield(L, -2, "occlusion");
+  lua_pushinteger(L, 2);
+  lua_setfield(L, -2, "gray_levels");
   lua_setfield(L, -2, "screen");
   // ctx.state
   lua_newtable(L);
@@ -1940,6 +2485,45 @@ bool ScriptHost::load(const std::string& name) {
     }
   }
   lua_setfield(L, -2, "state");
+
+  // --- 2.x additions (contract api-2.1.3) ----------------------------------
+  // ctx.api (section 19): this host implements the 2.1 contract.
+  lua_createtable(L, 0, 2);
+  lua_pushinteger(L, 2);
+  lua_setfield(L, -2, "major");
+  lua_pushinteger(L, 1);
+  lua_setfield(L, -2, "minor");
+  lua_setfield(L, -2, "api");
+  // ctx.capabilities (section 17): only what this firmware really has. Section
+  // 17 lets a host report any entry false, so the ones whose namespaces are not
+  // implemented yet (pattern, transforms, runtime TTF, ctx.ui, reader, dialog,
+  // frontlight, image decode) are false and their namespaces stay absent — an
+  // app that checks first degrades exactly as the contract prescribes.
+  lua_createtable(L, 0, 8);
+  lua_pushboolean(L, 0);
+  lua_setfield(L, -2, "pattern");
+  lua_pushboolean(L, 0);
+  lua_setfield(L, -2, "image_transform");
+  lua_pushboolean(L, 0);
+  lua_setfield(L, -2, "ttf");
+  lua_pushboolean(L, 0);
+  lua_setfield(L, -2, "ui");
+  lua_pushboolean(L, 0);
+  lua_setfield(L, -2, "reader");
+  lua_pushboolean(L, 0);
+  lua_setfield(L, -2, "dialog");
+  lua_pushboolean(L, 0);
+  lua_setfield(L, -2, "frontlight");
+  lua_pushboolean(L, 0);
+  lua_setfield(L, -2, "image_decode");
+  lua_setfield(L, -2, "capabilities");
+  // ctx.storage: private per-app files (section 9) + ctx.json (section 10).
+  luaL_newlib(L, storageFuncs);
+  lua_setfield(L, -2, "storage");
+  luaL_newlib(L, jsonFuncs);
+  pushJsonNull(L);
+  lua_setfield(L, -2, "null");
+  lua_setfield(L, -2, "json");
 
   // --- the rest of the 0.8 surface, as namespaces on ctx -------------------
   luaL_newlib(L, sysFuncs);
@@ -2074,6 +2658,20 @@ void ScriptHost::onEnter() {
 }
 
 void ScriptHost::onLeave() { callHandler("on_leave"); }
+
+// --- text metrics for the 2.x text options ---------------------------------
+int ScriptHost::textWidth(int fontId, const char* s) const {
+  if (fontId == 0 || s == nullptr) return 0;
+  return renderer.getTextWidth(fontId, s);
+}
+
+int ScriptHost::lineHeightOf(int fontId) const {
+  return fontId == 0 ? 0 : renderer.getLineHeight(fontId);
+}
+
+int ScriptHost::ascenderOf(int fontId) const {
+  return fontId == 0 ? 0 : renderer.getFontAscenderSize(fontId);
+}
 
 void ScriptHost::onUnload() {
   // Release HTTP tasks: a finished one is ours to delete, a running one is owned

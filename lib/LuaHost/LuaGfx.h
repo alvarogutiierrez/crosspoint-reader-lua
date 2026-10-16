@@ -75,9 +75,11 @@ class LuaGfx {
   int liveLayers() const;
   bool addClear(bool black);
   bool addText(int fontId, int x, int y, const char* s, bool black);
-  bool addRect(Kind kind, int x, int y, int w, int h, int lineWidth, bool black);
-  bool addLine(int x1, int y1, int x2, int y2, bool black);
-  bool addCircle(Kind kind, int cx, int cy, int radius, bool black);
+  // lineWidth/stroke only grows INWARD (2.x contract, section 6) and radius
+  // rounds all four corners; both default to the 0.8 look (1px, square).
+  bool addRect(Kind kind, int x, int y, int w, int h, int lineWidth, bool black, int radius = 0);
+  bool addLine(int x1, int y1, int x2, int y2, bool black, int lineWidth = 1);
+  bool addCircle(Kind kind, int cx, int cy, int radius, bool black, int lineWidth = 1);
   // Queue a preloaded 1bpp bitmap (bit1 = ink, row-major MSB-first) at x,y.
   // `ink` is the colour the set bits take: false draws the bitmap as paper
   // (an app flipping polarity with {invert = true}).
@@ -100,6 +102,8 @@ class LuaGfx {
     // drop the text silently — hence the dedicated field.
     int16_t a = 0, b = 0, c = 0, d = 0, e = 0;
     int32_t fontId = 0;  // Text only
+    // Rect only: 2.x opts.radius, the corner cut in px (0 = square corners).
+    int16_t radius = 0;
     uint8_t kind = 0;
     bool ink = true;
   };

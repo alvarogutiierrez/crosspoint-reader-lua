@@ -4,6 +4,8 @@
 #include <GfxRenderer.h>
 #include <Logging.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 
@@ -22,6 +24,38 @@ inline int16_t opGeom(int v) {
   if (v < -8192) return -8192;
   if (v > 8192) return 8192;
   return static_cast<int16_t>(v);
+}
+
+// 2.x rounded-rectangle row inset (contract section 6): row `dy` (0-based) pulls
+// in by r - round(sqrt(r^2 - (r - dy - 0.5)^2)); the bottom corners are the same
+// curve mirrored, which is why the smaller of dy and h-1-dy is used. Radius
+// beyond half the short side is clamped by the caller.
+inline int cornerInset(int r, int dy, int h) {
+  if (r <= 0) return 0;
+  int k = dy;
+  if (h - 1 - dy < k) k = h - 1 - dy;
+  if (k >= r) return 0;
+  const double t = static_cast<double>(r) - static_cast<double>(k) - 0.5;
+  const double inside = static_cast<double>(r) * static_cast<double>(r) - t * t;
+  if (inside <= 0.0) return 0;
+  int v = static_cast<int>(lround(sqrt(inside)));
+  if (v > r) v = r;
+  return r - v;
+}
+
+// Squared distance from a point to a segment, for the thick-line rule (2.x:
+// line_width > 1 covers the pixels whose centre is closer than line_width / 2).
+inline double segDistSq(double px, double py, double x0, double y0, double x1, double y1) {
+  const double dx = x1 - x0, dy = y1 - y0;
+  const double len2 = dx * dx + dy * dy;
+  double t = 0.0;
+  if (len2 > 0.0) {
+    t = ((px - x0) * dx + (py - y0) * dy) / len2;
+    if (t < 0.0) t = 0.0;
+    if (t > 1.0) t = 1.0;
+  }
+  const double ex = x0 + t * dx - px, ey = y0 + t * dy - py;
+  return ex * ex + ey * ey;
 }
 }  // namespace
 
@@ -110,7 +144,7 @@ bool LuaGfx::addImage(const uint8_t* bitmap, int w, int h, int x, int y, bool in
   return true;
 }
 
-bool LuaGfx::addRect(Kind kind, int x, int y, int w, int h, int lineWidth, bool black) {
+bool LuaGfx::addRect(Kind kind, int x, int y, int w, int h, int lineWidth, bool black, int radius) {
   Op* slot = nextOp();
   if (slot == nullptr) {
     ++dropped;
@@ -124,12 +158,13 @@ bool LuaGfx::addRect(Kind kind, int x, int y, int w, int h, int lineWidth, bool 
   op.c = opGeom(w);
   op.d = opGeom(h);
   op.e = opGeom(lineWidth);
+  op.radius = opGeom(radius);
   op.text = nullptr;
   ++opCount;
   return true;
 }
 
-bool LuaGfx::addLine(int x1, int y1, int x2, int y2, bool black) {
+bool LuaGfx::addLine(int x1, int y1, int x2, int y2, bool black, int lineWidth) {
   Op* slot = nextOp();
   if (slot == nullptr) {
     ++dropped;
@@ -142,13 +177,13 @@ bool LuaGfx::addLine(int x1, int y1, int x2, int y2, bool black) {
   op.b = opGeom(y1);
   op.c = opGeom(x2);
   op.d = opGeom(y2);
-  op.e = 0;
+  op.e = opGeom(lineWidth);
   op.text = nullptr;
   ++opCount;
   return true;
 }
 
-bool LuaGfx::addCircle(Kind kind, int cx, int cy, int radius, bool black) {
+bool LuaGfx::addCircle(Kind kind, int cx, int cy, int radius, bool black, int lineWidth) {
   Op* slot = nextOp();
   if (slot == nullptr) {
     ++dropped;
@@ -160,6 +195,7 @@ bool LuaGfx::addCircle(Kind kind, int cx, int cy, int radius, bool black) {
   op.a = opGeom(cx);
   op.b = opGeom(cy);
   op.c = opGeom(radius);
+  op.e = opGeom(lineWidth);
   op.text = nullptr;
   ++opCount;
   return true;
@@ -334,36 +370,85 @@ void LuaGfx::applyRange(int from, int to) {
         }
         break;
       case Kind::DrawRect:
-        if (targetLayer < 0) {
-          renderer.drawRect(op.a, op.b, op.c, op.d, op.e > 0 ? op.e : 1, op.ink);
-        } else {
-          putSpan(op.a, op.b, op.c, 1, op.ink);
-          putSpan(op.a, op.b + op.d - 1, op.c, 1, op.ink);
-          putSpan(op.a, op.b, 1, op.d, op.ink);
-          putSpan(op.a + op.c - 1, op.b, 1, op.d, op.ink);
+      case Kind::FillRect: {
+        const int w = op.c, h = op.d;
+        if (w <= 0 || h <= 0) break;  // contract: w/h <= 0 draws nothing
+        const int rmax = (w < h ? w : h) / 2;
+        int r = op.radius;
+        if (r < 0) r = 0;
+        if (r > rmax) r = rmax;  // radius beyond half the short side is clamped
+        if (kind == Kind::FillRect) {
+          for (int dy = 0; dy < h; ++dy) {
+            const int in = cornerInset(r, dy, h);
+            putSpan(op.a + in, op.b + dy, w - 2 * in, 1, op.ink);
+          }
+          break;
+        }
+        int lw = op.e > 0 ? op.e : 1;
+        if (lw > w) lw = w;
+        if (lw > h) lw = h;
+        if (r == 0 && targetLayer < 0) {
+          renderer.drawRect(op.a, op.b, w, h, lw, op.ink);
+          break;
+        }
+        // Stroke grows INWARD only (2.x, section 6): the outer span of each row
+        // minus that row's inner rounded-box span. The top/bottom `lw` rows are
+        // solid, the middle rows are two bands.
+        const int ih = h - 2 * lw;
+        const int ri = r - lw > 0 ? r - lw : 0;
+        for (int dy = 0; dy < h; ++dy) {
+          const int in = cornerInset(r, dy, h);
+          const int x0 = op.a + in;
+          const int x1 = op.a + w - 1 - in;
+          if (dy < lw || dy >= h - lw || ih <= 0) {
+            putSpan(x0, op.b + dy, x1 - x0 + 1, 1, op.ink);
+            continue;
+          }
+          const int ini = cornerInset(ri, dy - lw, ih);
+          const int x0i = op.a + lw + ini;
+          const int x1i = op.a + w - 1 - lw - ini;
+          if (x0i > x0) putSpan(x0, op.b + dy, x0i - x0, 1, op.ink);
+          if (x1 > x1i) putSpan(x1i + 1, op.b + dy, x1 - x1i, 1, op.ink);
         }
         break;
-      case Kind::FillRect:
-        putSpan(op.a, op.b, op.c, op.d, op.ink);
-        break;
-      case Kind::DrawLine:
-        if (targetLayer < 0) {
-          renderer.drawLine(op.a, op.b, op.c, op.d, op.ink);
-        } else {
-          int x0 = op.a, y0 = op.b;
-          const int x1 = op.c, y1 = op.d;
-          const int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
-          const int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
-          int err = dx + dy;
-          while (true) {
-            putPixel(x0, y0, op.ink);
-            if (x0 == x1 && y0 == y1) break;
-            const int e2 = 2 * err;
-            if (e2 >= dy) { err += dy; x0 += sx; }
-            if (e2 <= dx) { err += dx; y0 += sy; }
+      }
+      case Kind::DrawLine: {
+        const int lw = op.e > 0 ? op.e : 1;
+        if (lw <= 1) {
+          if (targetLayer < 0) {
+            renderer.drawLine(op.a, op.b, op.c, op.d, op.ink);
+          } else {
+            int x0 = op.a, y0 = op.b;
+            const int x1 = op.c, y1 = op.d;
+            const int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+            const int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+            int err = dx + dy;
+            while (true) {
+              putPixel(x0, y0, op.ink);
+              if (x0 == x1 && y0 == y1) break;
+              const int e2 = 2 * err;
+              if (e2 >= dy) { err += dy; x0 += sx; }
+              if (e2 <= dx) { err += dx; y0 += sy; }
+            }
+          }
+          break;
+        }
+        // 2.x: line_width > 1 covers every pixel whose centre is closer than
+        // line_width / 2 (distance to the segment, caps included).
+        const double half = lw / 2.0;
+        const int minx = std::min<int>(op.a, op.c) - lw;
+        const int maxx = std::max<int>(op.a, op.c) + lw;
+        const int miny = std::min<int>(op.b, op.d) - lw;
+        const int maxy = std::max<int>(op.b, op.d) + lw;
+        for (int y = miny; y <= maxy; ++y) {
+          for (int x = minx; x <= maxx; ++x) {
+            if (segDistSq(x + 0.5, y + 0.5, op.a, op.b, op.c, op.d) < half * half) {
+              putPixel(x, y, op.ink);
+            }
           }
         }
         break;
+      }
       case Kind::DrawCircle:
       case Kind::FillCircle: {
         // GfxRenderer has no circle primitive. The FILL is an exact scan (for
@@ -380,7 +465,7 @@ void LuaGfx::applyRange(int from, int to) {
             while (dx > 0 && dx * dx > inside) --dx;
             putSpan(op.a - dx, op.b + dy, 2 * dx + 1, 1, op.ink);
           }
-        } else {
+        } else if ((op.e > 0 ? op.e : 1) <= 1) {
           // 1px outline: midpoint circle over the 8 octants.
           int x = r, y = 0, err = 1 - r;
           while (x >= y) {
@@ -398,6 +483,34 @@ void LuaGfx::applyRange(int from, int to) {
             } else {
               --x;
               err += 2 * (y - x) + 1;
+            }
+          }
+        } else {
+          // 2.x ring: line_width grows INWARD, so each row keeps the annulus
+          // between the outer span (radius r) and the inner one (r - line_width).
+          int lw = op.e;
+          if (lw > r) lw = r;
+          const int ri = r - lw;
+          for (int dy = -r; dy <= r; ++dy) {
+            int dxo = r;
+            while (dxo > 0 && dxo * dxo > r * r - dy * dy) --dxo;
+            if (dxo <= 0) continue;
+            int dxi = -1;
+            if (ri > 0) {
+              const int insideI = ri * ri - dy * dy;
+              if (insideI >= 0) {
+                dxi = ri;
+                while (dxi > 0 && dxi * dxi > insideI) --dxi;
+              }
+            }
+            const int yy = op.b + dy;
+            if (dxi < 0) {
+              putSpan(op.a - dxo, yy, 2 * dxo + 1, 1, op.ink);
+              continue;
+            }
+            if (dxo - dxi > 0) {
+              putSpan(op.a - dxo, yy, dxo - dxi, 1, op.ink);
+              putSpan(op.a + dxi + 1, yy, dxo - dxi, 1, op.ink);
             }
           }
         }

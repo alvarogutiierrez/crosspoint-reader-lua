@@ -155,6 +155,12 @@ class ScriptHost {
   // skipped, which is what silently hid every label before).
   void setDefaultFont(int id) { defaultFontId = id; }
   int defaultFontId = 0;
+  // Text metrics for the 2.x text options (font:measure / line_height / ascent).
+  // The lib cannot reach the renderer's font map itself, so these wrap the
+  // renderer's own metrics for the injected font ids.
+  int textWidth(int fontId, const char* s) const;
+  int lineHeightOf(int fontId) const;
+  int ascenderOf(int fontId) const;
 
   // ctx:set_tick_rate(ms) callable target.
   void setTickIntervalMs(uint32_t ms) { tickIntervalMs = ms; }
