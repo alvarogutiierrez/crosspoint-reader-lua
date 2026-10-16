@@ -7,6 +7,7 @@
 // Loop task only: events in, Lua callbacks out. All drawing happens in
 // render() under the render task's RenderLock.
 
+
 bool LuaAppActivity::dispatchInput() {
   if (host == nullptr || !host->loaded()) return false;
 

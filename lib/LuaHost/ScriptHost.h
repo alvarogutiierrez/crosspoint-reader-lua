@@ -97,6 +97,33 @@ class ScriptHost {
   void setLastError(const std::string& e) { lastErrorV = e; }
   // ctx.longtask:start()/feed()/stop() state (our port never aborts callbacks).
   bool longTaskActive = false;
+
+  // --- ctx.net: async HTTP ---------------------------------------------------
+  // Exposed only when manifest.json declares permissions: ["net.http"], exactly
+  // as the original does. The request runs on its own task and writes into a
+  // HEAP-allocated task record; poll() only reads it, so the Lua state is never
+  // touched from another task and an app unloading with a request in flight
+  // cannot leave the worker holding a pointer into a destroyed host.
+  struct NetTask {
+    bool ok = false;
+    volatile bool started = false;  // a worker took it
+    volatile bool done = false;
+    volatile bool cancelled = false;
+    volatile int status = 0;
+    volatile size_t bytes = 0;
+    std::string url;
+    std::string reqBody;
+    std::string headers;  // "Name: value\r\n" lines
+    std::string resp;
+    std::string err;
+    void* task = nullptr;
+  };
+  static constexpr int MAX_NET_TASKS = 4;
+  static constexpr size_t MAX_NET_RESPONSE = 32 * 1024;
+  static constexpr size_t MAX_NET_REQUEST = 8 * 1024;
+  NetTask* netTasks[MAX_NET_TASKS] = {nullptr};
+  bool hasPermission(const char* perm) const;
+  int netStart(const char* url, const char* body, const char* headers);
   // ctx.assets:evict(key) — drop a preloaded asset.
   bool evictAsset(const char* key);
   // Set by the activity: UI language code for ctx.i18n (the lib cannot reach

@@ -10,6 +10,8 @@
 
 #include "HalStorage.h"
 
+#include <NetworkClient.h>
+
 #include <BatteryMonitor.h>
 #include <HalClock.h>
 #include <HalPowerManager.h>
@@ -976,6 +978,263 @@ const luaL_Reg layersFuncs[] = {
     {"create", layers_create}, {nullptr, nullptr},
 };
 
+
+// --- ctx.net: async HTTP ---------------------------------------------------
+//
+// The request runs on its own task and writes into a HEAP-allocated record; the
+// binding only reads it, so the Lua state is never touched from another task.
+// Gated on the manifest's permissions: ["net.http"], exactly like the original
+// (the doc: "ctx.net is available only after this permission is declared").
+
+
+// Minimal HTTP/1.1 client over the Arduino NetworkClient. The doc guarantees
+// http:// only (net.http), which is exactly what a plain TCP client covers;
+// https:// answers "unsupported_scheme" instead of pretending.
+bool parseHttpUrl(const std::string& url, std::string& host, uint16_t& port, std::string& path) {
+  if (url.rfind("http://", 0) != 0) return false;
+  const std::string rest = url.substr(7);
+  const size_t slash = rest.find('/');
+  const std::string authority = (slash == std::string::npos) ? rest : rest.substr(0, slash);
+  path = (slash == std::string::npos) ? "/" : rest.substr(slash);
+  host = authority;
+  port = 80;
+  const size_t colon = authority.find(':');
+  if (colon != std::string::npos) {
+    host = authority.substr(0, colon);
+    port = static_cast<uint16_t>(atoi(authority.substr(colon + 1).c_str()));
+  }
+  return !host.empty() && port > 0;
+}
+
+// Reads one CRLF line (without the CRLF); empty string on timeout/close.
+std::string netReadLine(NetworkClient& c, uint32_t timeoutMs) {
+  std::string line;
+  const uint32_t start = millis();
+  while (millis() - start < timeoutMs) {
+    if (!c.connected() && !c.available()) break;
+    const int ch = c.read();
+    if (ch < 0) {
+      delay(1);
+      continue;
+    }
+    if (ch == '\n') {
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      return line;
+    }
+    line.push_back(static_cast<char>(ch));
+    if (line.size() > 2048) break;
+  }
+  return line;
+}
+
+void netWorkerTask(void* arg) {
+  ScriptHost::NetTask* t = static_cast<ScriptHost::NetTask*>(arg);
+  if (!t->cancelled) {
+    std::string host, path;
+    uint16_t port = 80;
+    if (t->url.rfind("https://", 0) == 0) {
+      t->err = "unsupported_scheme";  // https is not part of the net.http contract
+    } else if (!parseHttpUrl(t->url, host, port, path)) {
+      t->err = "invalid_url";
+    } else {
+      NetworkClient client;
+      client.setTimeout(15000);
+      if (!client.connect(host.c_str(), port, 10000)) {
+        t->err = "connect_failed";
+      } else {
+        const bool post = !t->reqBody.empty();
+        std::string req = std::string(post ? "POST " : "GET ") + path + " HTTP/1.1\r\n";
+        req += "Host: " + host + "\r\n";
+        req += "Connection: close\r\n";
+        req += "Accept: */*\r\n";
+        if (post) {
+          req += "Content-Length: " + std::to_string(t->reqBody.size()) + "\r\n";
+          req += "Content-Type: text/plain\r\n";
+        }
+        size_t hp = 0;
+        while (hp < t->headers.size()) {
+          const size_t eol = t->headers.find('\n', hp);
+          const std::string line =
+              t->headers.substr(hp, (eol == std::string::npos ? t->headers.size() : eol) - hp);
+          if (!line.empty()) req += line + "\r\n";
+          if (eol == std::string::npos) break;
+          hp = eol + 1;
+        }
+        req += "\r\n";
+        if (post) req += t->reqBody;
+        client.write(reinterpret_cast<const uint8_t*>(req.data()), req.size());
+
+        const std::string status = netReadLine(client, 15000);
+        if (status.rfind("HTTP/", 0) == 0) {
+          const size_t sp = status.find(' ');
+          t->status = (sp != std::string::npos) ? atoi(status.c_str() + sp + 1) : 0;
+        }
+        long contentLength = -1;
+        bool chunked = false;
+        while (true) {
+          const std::string line = netReadLine(client, 15000);
+          if (line.empty()) break;
+          std::string lower = line;
+          for (char& ch : lower) ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+          if (lower.rfind("content-length:", 0) == 0) {
+            contentLength = atol(lower.c_str() + 15);
+          } else if (lower.find("transfer-encoding:") == 0 && lower.find("chunked") != std::string::npos) {
+            chunked = true;
+          }
+        }
+        std::string body;
+        if (chunked) {
+          while (body.size() < ScriptHost::MAX_NET_RESPONSE) {
+            const std::string sizeLine = netReadLine(client, 15000);
+            if (sizeLine.empty()) break;
+            const long chunk = strtol(sizeLine.c_str(), nullptr, 16);
+            if (chunk <= 0) break;
+            const size_t before = body.size();
+            const uint32_t start = millis();
+            while (body.size() - before < static_cast<size_t>(chunk) && millis() - start < 15000) {
+              const int ch = client.read();
+              if (ch < 0) {
+                delay(1);
+                continue;
+              }
+              body.push_back(static_cast<char>(ch));
+            }
+            netReadLine(client, 2000);  // trailing CRLF
+          }
+        } else {
+          const uint32_t start = millis();
+          while (body.size() < ScriptHost::MAX_NET_RESPONSE && millis() - start < 30000) {
+            if (contentLength >= 0 && body.size() >= static_cast<size_t>(contentLength)) break;
+            if (client.available() == 0 && !client.connected()) break;
+            const int ch = client.read();
+            if (ch < 0) {
+              if (!client.connected()) break;
+              delay(1);
+              continue;
+            }
+            body.push_back(static_cast<char>(ch));
+          }
+        }
+        client.stop();
+        t->resp = body;
+        t->bytes = body.size();
+        t->ok = t->status >= 200 && t->status < 300;
+        if (t->status == 0 && t->err.empty()) t->err = "no_response";
+      }
+    }
+  }
+  if (t->cancelled && t->err.empty()) t->err = "cancelled";
+  t->done = true;
+  t->task = nullptr;
+  vTaskDelete(nullptr);
+}
+
+int net_get(lua_State* L) {
+  ScriptHost* host = hostOf(L);
+  const int base = (lua_type(L, 1) == LUA_TTABLE) ? 2 : 1;
+  const char* url = luaL_checkstring(L, base);
+  const int id = host->netStart(url, nullptr, nullptr);
+  if (id < 0) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "unavailable");
+    return 2;
+  }
+  lua_pushinteger(L, id);
+  return 1;
+}
+
+int net_post(lua_State* L) {
+  ScriptHost* host = hostOf(L);
+  const int base = (lua_type(L, 1) == LUA_TTABLE) ? 2 : 1;
+  const char* url = luaL_checkstring(L, base);
+  const char* body = luaL_optstring(L, base + 1, "");
+  std::string headers;
+  if (lua_istable(L, base + 2)) {
+    lua_pushnil(L);
+    while (lua_next(L, base + 2) != 0) {
+      const char* value = lua_tostring(L, -1);
+      lua_pop(L, 1);
+      const char* name = lua_tostring(L, -1);
+      if (name != nullptr && value != nullptr) {
+        headers += name;
+        headers += ": ";
+        headers += value;
+        headers += '\n';
+      }
+    }
+  }
+  const int id = host->netStart(url, body, headers.empty() ? nullptr : headers.c_str());
+  if (id < 0) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "unavailable");
+    return 2;
+  }
+  lua_pushinteger(L, id);
+  return 1;
+}
+
+int net_poll(lua_State* L) {
+  ScriptHost* host = hostOf(L);
+  const int base = (lua_type(L, 1) == LUA_TTABLE) ? 2 : 1;
+  const int id = static_cast<int>(luaL_checkinteger(L, base));
+  if (id < 0 || id >= ScriptHost::MAX_NET_TASKS || host->netTasks[id] == nullptr) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "invalid_task");
+    return 2;
+  }
+  ScriptHost::NetTask* t = host->netTasks[id];
+  lua_createtable(L, 0, 6);
+  lua_pushboolean(L, t->done ? 1 : 0);
+  lua_setfield(L, -2, "done");
+  lua_pushboolean(L, t->ok ? 1 : 0);
+  lua_setfield(L, -2, "ok");
+  lua_pushinteger(L, t->status);
+  lua_setfield(L, -2, "status");
+  lua_pushinteger(L, static_cast<lua_Integer>(t->bytes));
+  lua_setfield(L, -2, "bytes");
+  if (t->done) {
+    lua_pushlstring(L, t->resp.c_str(), t->resp.size());
+    lua_setfield(L, -2, "body");
+    if (!t->err.empty()) {
+      lua_pushstring(L, t->err.c_str());
+    } else {
+      lua_pushnil(L);
+    }
+    lua_setfield(L, -2, "err");
+  } else {
+    lua_pushnil(L);
+    lua_setfield(L, -2, "body");
+    lua_pushnil(L);
+    lua_setfield(L, -2, "err");
+  }
+  return 1;
+}
+
+int net_cancel(lua_State* L) {
+  ScriptHost* host = hostOf(L);
+  const int base = (lua_type(L, 1) == LUA_TTABLE) ? 2 : 1;
+  const int id = static_cast<int>(luaL_checkinteger(L, base));
+  if (id < 0 || id >= ScriptHost::MAX_NET_TASKS || host->netTasks[id] == nullptr) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+  ScriptHost::NetTask* t = host->netTasks[id];
+  if (t->done) {
+    delete t;  // worker is gone; safe to free here
+    host->netTasks[id] = nullptr;
+  } else {
+    // In flight: the worker owns the record until it finishes, then frees it.
+    t->cancelled = true;
+    host->netTasks[id] = nullptr;
+  }
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+const luaL_Reg netFuncs[] = {
+    {"get", net_get}, {"post", net_post}, {"poll", net_poll}, {"cancel", net_cancel}, {nullptr, nullptr},
+};
+
 // --- ctx bindings ------------------------------------------------------
 
 int ctx_screen(lua_State* L) {
@@ -1496,6 +1755,54 @@ void ScriptHost::saveState() {
   lua_pop(L, 1);
 }
 
+bool ScriptHost::hasPermission(const char* perm) const {
+  if (perm == nullptr) return false;
+  for (const std::string& p : permissions) {
+    if (p == perm) return true;
+  }
+  return false;
+}
+
+int ScriptHost::netStart(const char* url, const char* body, const char* headers) {
+  if (url == nullptr || url[0] == '\0') return -1;
+  int slot = -1;
+  for (int i = 0; i < MAX_NET_TASKS; ++i) {
+    if (netTasks[i] == nullptr) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot < 0) {
+    // Reclaim the oldest finished task rather than refusing a new request.
+    for (int i = 0; i < MAX_NET_TASKS; ++i) {
+      if (netTasks[i] != nullptr && netTasks[i]->done) {
+        delete netTasks[i];
+        netTasks[i] = nullptr;
+        slot = i;
+        break;
+      }
+    }
+  }
+  if (slot < 0) return -1;
+  NetTask* t = new (std::nothrow) NetTask();
+  if (t == nullptr) return -1;
+  t->url = url;
+  if (body != nullptr) {
+    const size_t n = strlen(body);
+    t->reqBody.assign(body, n < MAX_NET_REQUEST ? n : MAX_NET_REQUEST);
+  }
+  if (headers != nullptr) t->headers = headers;
+  t->started = true;
+  netTasks[slot] = t;
+  if (xTaskCreatePinnedToCore(netWorkerTask, "xtnet", 8192, t, 1, nullptr, tskNO_AFFINITY) != pdPASS) {
+    netTasks[slot] = nullptr;
+    delete t;
+    return -1;
+  }
+  LOG_INF("LUAHOST", " net task %d: %s", slot, url);
+  return slot;
+}
+
 bool ScriptHost::load(const std::string& name) {
   app = name;
   appPathV = std::string("/apps/") + name + "/";
@@ -1664,6 +1971,17 @@ bool ScriptHost::load(const std::string& name) {
     return false;
   }
   preloadAssets();
+  // ctx.net exists only with the manifest's "net.http" permission, exactly as the
+  // doc states, so it is published once the manifest has been parsed.
+  if (hasPermission("net.http")) {
+    lua_getglobal(L, "ctx");
+    if (lua_istable(L, -1)) {
+      luaL_newlib(L, netFuncs);
+      lua_setfield(L, -2, "net");
+    }
+    lua_pop(L, 1);
+    LOG_INF("LUAHOST", " ctx.net published (net.http declared)");
+  }
   callHandler("on_load");
   LOG_INF("LUAHOST", " %s loaded (%s)", app.c_str(), loadErr.empty() ? "ok" : loadErr.c_str());
   return true;
@@ -1710,6 +2028,18 @@ void ScriptHost::onEnter() {
 void ScriptHost::onLeave() { callHandler("on_leave"); }
 
 void ScriptHost::onUnload() {
+  // Release HTTP tasks: a finished one is ours to delete, a running one is owned
+  // by its worker (marking it cancelled makes the worker free it on completion)
+  // so nothing keeps a pointer into this host.
+  for (int i = 0; i < MAX_NET_TASKS; ++i) {
+    if (netTasks[i] == nullptr) continue;
+    if (netTasks[i]->done || !netTasks[i]->started) {
+      delete netTasks[i];  // finished, or never picked up by a worker
+    } else {
+      netTasks[i]->cancelled = true;  // the worker frees it when it returns
+    }
+    netTasks[i] = nullptr;
+  }
   if (L == nullptr) return;
   callHandler("on_unload");
   callHandler("on_leave");
