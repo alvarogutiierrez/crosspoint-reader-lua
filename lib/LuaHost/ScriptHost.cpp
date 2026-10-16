@@ -554,8 +554,16 @@ bool ScriptHost::preloadAssets() {
           int h = hdr[6] | (hdr[7] << 8);
           size_t need = static_cast<size_t>((w + 7) / 8) * h;
           if (w <= 0 || h <= 0 || raw.size() < 16 + need) break;
+          // XIC layout: "XIC", u16 width, u16 height, flags — Studio writes a
+          // 24-BYTE header. Reading such a file with a 16-byte header leaves 8
+          // "trailing" bytes and shifts every payload row by 64 bits, so each
+          // row starts with the previous row's tail: the art shows a wrapped
+          // strip of its right edge along the left (the "looping background").
+          // Derive the payload start from the file size instead of assuming.
+          size_t headerBytes = raw.size() - need;
+          if (headerBytes < 16 || headerBytes > 64) headerBytes = 16;
           uint8_t* bits = new uint8_t[need];
-          memcpy(bits, raw.data() + 16, need);
+          memcpy(bits, raw.data() + headerBytes, need);
           assets.push_back(LoadedAsset{k, w, h, bits});
           LOG_INF("LUAHOST", " asset %s: %dx%d (%u B)", k.c_str(), w, h,
                   static_cast<unsigned>(need));
