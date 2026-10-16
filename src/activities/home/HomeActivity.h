@@ -60,7 +60,9 @@ class HomeActivity final : public Activity {
   int flowCoverHeight() const;
   void drawFlow();
   void drawFlowCover(const RecentBook& book, Rect rect, int thumbHeight, bool centre);
-  void drawFlowChevron(int centreX, int y);
+  // Small flat bold chevron: down (∨) travels to the home, up (∧) travels back to
+  // the carousel from the home.
+  void drawChevron(int centreX, int y, bool up);
   void roundCoverCorners(Rect rect, int radius);
   const HomeMenuItem initialMenuItem;
   const bool cleanInitialRefresh;

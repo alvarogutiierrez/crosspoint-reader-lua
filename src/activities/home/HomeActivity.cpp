@@ -408,12 +408,20 @@ void HomeActivity::loop() {
     }
     // Nothing on this page consumed the event: fall through so Back still opens
     // the most recent book.
-  } else if (!flowActive && flowHasBooks() && selectorIndex == 0 &&
-             (mappedInput.wasPressed(MappedInputManager::Button::Up) || swipe == MappedInputManager::SwipeDir::Down)) {
-    // Travelling back up from the top of the home returns to the carousel.
-    flowActive = true;
-    requestUpdate();
-    return;
+  } else if (!flowActive && flowHasBooks()) {
+    // The way back up: the inverted chevron above the book, or Up from the first
+    // item. wasScreenTapped is a const snapshot read, so the home's own touch
+    // routing still sees this tap when it is not ours.
+    int tapX = 0;
+    int tapY = 0;
+    const bool onChevron = mappedInput.wasScreenTapped(tapX, tapY) && tapY >= metrics.homeTopPadding - 44 &&
+                           tapY <= metrics.homeTopPadding - 4;
+    if (onChevron || (selectorIndex == 0 && (mappedInput.wasPressed(MappedInputManager::Button::Up) ||
+                                             swipe == MappedInputManager::SwipeDir::Down))) {
+      flowActive = true;
+      requestUpdate();
+      return;
+    }
   }
 
   if (swipe == MappedInputManager::SwipeDir::Up) {
@@ -609,6 +617,10 @@ void HomeActivity::render(RenderLock&&) {
                           recentBooks, selectorIndex, coverRendered, coverBufferStored, bufferRestored,
                           std::bind(&HomeActivity::storeCoverBuffer, this));
 
+  // The way back up to the carousel: the same small chevron, inverted, centred
+  // just above the book. Only when there IS a carousel to go back to.
+  if (flowHasBooks()) drawChevron(pageWidth / 2, metrics.homeTopPadding - 32, true);
+
   // Build menu items dynamically
   std::vector<const char*> menuItems = {tr(STR_BROWSE_FILES), tr(STR_LIBRARY), tr(STR_FILE_TRANSFER),
                                         tr(STR_SETTINGS_TITLE), tr(STR_APPS)};
@@ -690,14 +702,15 @@ const RecentBook* HomeActivity::flowCurrent() const {
 
 int HomeActivity::flowCoverHeight() const {
   const auto& metrics = UITheme::getInstance().getMetrics();
-  // Between the title line and the travel band at the bottom.
+  // This page has NO footer band (the reader asked for the menu to be gone, so
+  // the covers get the room): the only thing reserved below the cover is the
+  // chevron.
   const int top = metrics.homeTopPadding + 36;
-  const int bottom = renderer.getScreenHeight() - metrics.buttonHintsHeight - 54;
+  const int bottom = renderer.getScreenHeight() - 46;
   const int room = std::max(80, bottom - top);
-  // The centre cover may take ~2/3 of the width, so its 2:3 aspect caps the
-  // height: the neighbours keep a visible strip at each edge, which is what
-  // makes it read as a carousel instead of one lonely cover.
-  const int maxW = renderer.getScreenWidth() * 66 / 100;
+  // ~58% of the width leaves a generous strip of the neighbours visible at each
+  // edge — that strip is what tells the reader there are more books to the sides.
+  const int maxW = renderer.getScreenWidth() * 58 / 100;
   return std::min(room, maxW * 3 / 2);
 }
 
@@ -706,7 +719,9 @@ HomeActivity::FlowGeom HomeActivity::flowGeometry() const {
   FlowGeom g;
   g.coverH = flowCoverHeight();
   g.coverW = std::max(1, g.coverH * 2 / 3);
-  g.coverTop = metrics.homeTopPadding + 36;
+  const int top = metrics.homeTopPadding + 36;
+  const int bottom = renderer.getScreenHeight() - 46;
+  g.coverTop = top + std::max(0, (bottom - top - g.coverH) / 2);  // centred in the free space
   g.coverX = (renderer.getScreenWidth() - g.coverW) / 2;
   g.bandTop = g.coverTop + g.coverH + 4;
   return g;
@@ -729,19 +744,21 @@ void HomeActivity::drawFlowCover(const RecentBook& book, const Rect rect, const 
     }
   }
   if (!drawn) GUI.drawCoverPlaceholder(renderer, rect);
-  // Only the centre cover is rounded; the neighbours are clipped by the panel
-  // edge anyway and the carve is the one place pixels are touched one by one.
-  if (centre) roundCoverCorners(rect, 14);
+  // Only the centre cover is rounded, and only slightly (the reference has
+  // square corners; a light radius keeps it from looking like a bare crop).
+  if (centre) roundCoverCorners(rect, 8);
 }
 
-void HomeActivity::drawFlowChevron(const int centreX, const int y) {
-  // Small, discreet and flat, hugging the bottom of the screen: bold (3px) but
-  // a wide vertex angle, so it hints "there is more below" instead of shouting.
+void HomeActivity::drawChevron(const int centreX, const int y, const bool up) {
+  // Small, discreet and flat: bold (3px) but a wide vertex angle, so it hints
+  // "there is more this way" instead of shouting. `y` is the vertex for a down
+  // chevron and the top edge for an up one.
   constexpr int HALF_SPAN = 26;
   constexpr int DROP = 12;
   constexpr int WEIGHT = 3;
-  renderer.drawLine(centreX - HALF_SPAN, y, centreX, y + DROP, WEIGHT, true);
-  renderer.drawLine(centreX, y + DROP, centreX + HALF_SPAN, y, WEIGHT, true);
+  const int tip = up ? y : y + DROP;
+  renderer.drawLine(centreX - HALF_SPAN, up ? y + DROP : y, centreX, tip, WEIGHT, true);
+  renderer.drawLine(centreX, tip, centreX + HALF_SPAN, up ? y + DROP : y, WEIGHT, true);
 }
 
 void HomeActivity::roundCoverCorners(const Rect rect, const int radius) {
@@ -791,37 +808,29 @@ void HomeActivity::drawFlow() {
 
   // Carousel. The neighbours draw at the SAME size as the centre cover — one
   // thumb size means one set of generated covers, and rescaling a dithered
-  // 1-bit cover aliases badly — and they keep a visible strip at each edge.
-  constexpr int SIDE_GAP = 6;
+  // 1-bit cover aliases badly — and they TOUCH it (no gap), so the three read as
+  // one continuous surface, exactly like the reference mockup.
   const int n = static_cast<int>(flowBooks.size());
   if (flowIndex > 0) {
-    drawFlowCover(flowBooks[flowIndex - 1], Rect{g.coverX - SIDE_GAP - g.coverW, g.coverTop, g.coverW, g.coverH},
-                  g.coverH, false);
+    drawFlowCover(flowBooks[flowIndex - 1], Rect{g.coverX - g.coverW, g.coverTop, g.coverW, g.coverH}, g.coverH,
+                  false);
   }
   if (flowIndex + 1 < n) {
-    drawFlowCover(flowBooks[flowIndex + 1], Rect{g.coverX + g.coverW + SIDE_GAP, g.coverTop, g.coverW, g.coverH},
-                  g.coverH, false);
+    drawFlowCover(flowBooks[flowIndex + 1], Rect{g.coverX + g.coverW, g.coverTop, g.coverW, g.coverH}, g.coverH,
+                  false);
   }
   drawFlowCover(book, Rect{g.coverX, g.coverTop, g.coverW, g.coverH}, g.coverH, true);
 
-  // Read percentage when the firmware knows it, then the chevron at the very
-  // bottom of the screen — where its tap band is.
+  // Read percentage when the firmware knows it, then the chevron above the very
+  // bottom edge — where its tap band is. (Raised a little from the first cut.)
   if (flowPct[flowIndex] >= 0) {
     char pctText[16];
     snprintf(pctText, sizeof(pctText), "%d%%", flowPct[flowIndex]);
     renderer.drawCenteredText(UI_10_FONT_ID, g.bandTop + 8, pctText);
   }
-  drawFlowChevron(renderer.getScreenWidth() / 2, renderer.getScreenHeight() - metrics.buttonHintsHeight - 26);
-
-  // TEMPORARY (this build only): the carousel showed ONE cover on the device and
-  // the counts are the datum I cannot see from here. Remove once reported.
-  char diag[72];
-  snprintf(diag, sizeof(diag), "recents=%u flow=%u i=%d pct=%d", static_cast<unsigned>(recentBooks.size()),
-           static_cast<unsigned>(flowBooks.size()), flowIndex, flowPct[flowIndex]);
-  renderer.drawText(UI_10_FONT_ID, 6, renderer.getScreenHeight() - metrics.buttonHintsHeight - 44, diag);
-
-  const auto labels = mappedInput.mapLabels(tr(STR_RESUME), tr(STR_SELECT), tr(STR_DIR_LEFT), tr(STR_DIR_RIGHT));
-  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  drawChevron(renderer.getScreenWidth() / 2, renderer.getScreenHeight() - 56, false);
+  // No footer band on this page: the reader asked for the menu to be gone so the
+  // covers get the room, and the chevron is the only thing to press here.
 }
 
 void HomeActivity::onSelectBook(const std::string& path) { activityManager.goToReader(path); }
