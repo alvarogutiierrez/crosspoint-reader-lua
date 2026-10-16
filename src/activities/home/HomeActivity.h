@@ -46,6 +46,7 @@ class HomeActivity final : public Activity {
   bool flowHasBooks() const { return !flowBooks.empty(); }
   void buildFlow();
   void flowMove(int delta);
+  bool ensureCoverThumbFor(const RecentBook& book, int thumbHeight);
   const RecentBook* flowCurrent() const;
   // The carousel's geometry, shared by the drawing and the touch targets so a
   // tap lands on what is actually painted.

@@ -559,10 +559,25 @@ void HomeActivity::render(RenderLock&&) {
       firstRenderDone = true;
       requestUpdate();
     } else if (!recentsLoaded && !recentsLoading) {
-      // The carousel draws its own (bigger) cover size, so the thumbs for it are
-      // generated once here and the next pass draws them.
+      // The carousel draws its own (bigger) cover size and its own book LIST, so
+      // the thumbs are prepared here from the same list it draws.
       recentsLoading = true;
-      loadRecentCovers(flowCoverHeight());
+      const int flowThumbHeight = flowCoverHeight();
+      Rect popup;
+      bool popupShown = false;
+      int done = 0;
+      for (const RecentBook& book : flowBooks) {
+        if (!popupShown) {
+          popupShown = true;
+          popup = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+        }
+        ensureCoverThumbFor(book, flowThumbHeight);
+        ++done;
+        GUI.fillPopupProgress(renderer, popup, done * 100 / static_cast<int>(flowBooks.size()));
+      }
+      recentsLoaded = true;
+      recentsLoading = false;
+      requestUpdate();
     }
     return;
   }
@@ -675,18 +690,43 @@ void HomeActivity::buildFlow() {
   flowPct.clear();
   flowIndex = 0;
   flowActive = true;
-  // "Started and not finished": every recents entry the reader has not finished
-  // (100%). A progress of -1 means the saved position could not be read (an
-  // older cache, or an XTC with no progress yet) and still counts as unfinished
-  // — a recents entry only exists for a book that was opened at some point.
-  for (const RecentBook& book : recentBooks) {
+  // "Started and not finished": the FULL recents store, not HomeActivity's
+  // `recentBooks`. That vector is capped by the theme's homeRecentBooksCount —
+  // LYRA sets it to 1 because its home shows a single cover — which is exactly
+  // why the carousel had one book on a device with several left half-read.
+  // Books the reader has finished are removed from recents by the firmware
+  // (SETTINGS.removeReadBooksFromRecents), so this list is "in progress".
+  for (const RecentBook& book : RECENT_BOOKS.getBooks()) {
+    if (flowBooks.size() >= RecentBooksStore::MAX_RECENT_BOOKS) break;
+    if (RecentBooksStore::isMissing(book)) continue;
     const int pct = loadBookProgress(book.path);
     if (pct >= 100) continue;
     flowBooks.push_back(book);
     flowPct.push_back(pct);
   }
   LOG_INF("HOME", "cover flow: %u of %u recents unfinished", static_cast<unsigned>(flowBooks.size()),
-          static_cast<unsigned>(recentBooks.size()));
+          static_cast<unsigned>(RECENT_BOOKS.getBooks().size()));
+}
+
+// Generates the dithered cover thumb for one book at `thumbHeight` when it is
+// missing. Mirrors what loadRecentCovers does per recent book, but takes the
+// book as an argument so the carousel can prepare its own (bigger) thumbs
+// without dragging the whole recents list along.
+bool HomeActivity::ensureCoverThumbFor(const RecentBook& book, const int thumbHeight) {
+  if (book.coverBmpPath.empty()) return false;
+  const std::string thumb = UITheme::getCoverThumbPath(book.coverBmpPath, thumbHeight);
+  if (Storage.exists(thumb.c_str())) return true;
+  if (FsHelpers::hasReflowableBookExtension(book.path)) {
+    Epub epub(book.path, "/.crosspoint");
+    epub.load(false, true);  // metadata only; no css
+    return epub.generateThumbBmp(thumbHeight);
+  }
+  if (FsHelpers::hasXtcExtension(book.path)) {
+    Xtc xtc(book.path, "/.crosspoint");
+    if (!xtc.load()) return false;
+    return xtc.generateThumbBmp(thumbHeight);
+  }
+  return false;
 }
 
 void HomeActivity::flowMove(const int delta) {
