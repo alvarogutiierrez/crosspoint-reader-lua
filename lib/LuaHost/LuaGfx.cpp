@@ -14,6 +14,17 @@ void LuaGfx::reset() {
   imagesQueued = 0;
 }
 
+namespace {
+// Geometry values are packed into int16. Anything outside the panel's range is
+// clamped rather than wrapped (a wrapped radius would make a rasterizer loop
+// thousands of times on a value the app never meant to pass).
+inline int16_t opGeom(int v) {
+  if (v < -8192) return -8192;
+  if (v > 8192) return 8192;
+  return static_cast<int16_t>(v);
+}
+}  // namespace
+
 LuaGfx::Op* LuaGfx::nextOp() {
   if (opCount >= MAX_OPS) return nullptr;  // caller counts the drop
   const size_t used = static_cast<size_t>(opCount);
@@ -72,9 +83,9 @@ bool LuaGfx::addText(int fontId, int x, int y, const char* s, bool black) {
   Op& op = *slot;
   op.kind = static_cast<uint8_t>(Kind::Text);
   op.ink = black;
-  op.a = static_cast<int16_t>(x);
-  op.b = static_cast<int16_t>(y);
-  op.c = static_cast<int16_t>(fontId);
+  op.a = opGeom(x);
+  op.b = opGeom(y);
+  op.fontId = fontId;  // 32-bit hash: never narrow this one
   op.text = textSlot;
   ++opCount;
   return true;
@@ -88,10 +99,10 @@ bool LuaGfx::addImage(const uint8_t* bitmap, int w, int h, int x, int y, bool in
   }
   Op& op = *slot;
   op.kind = static_cast<uint8_t>(Kind::Image);
-  op.a = static_cast<int16_t>(x);
-  op.b = static_cast<int16_t>(y);
-  op.c = static_cast<int16_t>(w);
-  op.d = static_cast<int16_t>(h);
+  op.a = opGeom(x);
+  op.b = opGeom(y);
+  op.c = opGeom(w);
+  op.d = opGeom(h);
   op.ink = ink;
   op.bitmap = bitmap;
   ++imagesQueued;
@@ -108,11 +119,11 @@ bool LuaGfx::addRect(Kind kind, int x, int y, int w, int h, int lineWidth, bool 
   Op& op = *slot;
   op.kind = static_cast<uint8_t>(kind);
   op.ink = black;
-  op.a = static_cast<int16_t>(x);
-  op.b = static_cast<int16_t>(y);
-  op.c = static_cast<int16_t>(w);
-  op.d = static_cast<int16_t>(h);
-  op.e = static_cast<int16_t>(lineWidth);
+  op.a = opGeom(x);
+  op.b = opGeom(y);
+  op.c = opGeom(w);
+  op.d = opGeom(h);
+  op.e = opGeom(lineWidth);
   op.text = nullptr;
   ++opCount;
   return true;
@@ -127,10 +138,10 @@ bool LuaGfx::addLine(int x1, int y1, int x2, int y2, bool black) {
   Op& op = *slot;
   op.kind = static_cast<uint8_t>(Kind::DrawLine);
   op.ink = black;
-  op.a = static_cast<int16_t>(x1);
-  op.b = static_cast<int16_t>(y1);
-  op.c = static_cast<int16_t>(x2);
-  op.d = static_cast<int16_t>(y2);
+  op.a = opGeom(x1);
+  op.b = opGeom(y1);
+  op.c = opGeom(x2);
+  op.d = opGeom(y2);
   op.e = 0;
   op.text = nullptr;
   ++opCount;
@@ -146,9 +157,9 @@ bool LuaGfx::addCircle(Kind kind, int cx, int cy, int radius, bool black) {
   Op& op = *slot;
   op.kind = static_cast<uint8_t>(kind);
   op.ink = black;
-  op.a = static_cast<int16_t>(cx);
-  op.b = static_cast<int16_t>(cy);
-  op.c = static_cast<int16_t>(radius);
+  op.a = opGeom(cx);
+  op.b = opGeom(cy);
+  op.c = opGeom(radius);
   op.text = nullptr;
   ++opCount;
   return true;
@@ -242,9 +253,9 @@ bool LuaGfx::addLayerBlit(int id, int x, int y, bool black) {
   Op& op = *slot;
   op.kind = static_cast<uint8_t>(Kind::LayerBlit);
   op.ink = black;
-  op.a = static_cast<int16_t>(id);
-  op.b = static_cast<int16_t>(x);
-  op.c = static_cast<int16_t>(y);
+  op.a = opGeom(id);
+  op.b = opGeom(x);
+  op.c = opGeom(y);
   op.d = 0;
   op.e = 0;
   op.text = nullptr;
@@ -319,7 +330,7 @@ void LuaGfx::applyRange(int from, int to) {
           LOG_ERR("LUAHOST", "g:text inside layer:draw_with is not supported, skipped");
           ++dropped;
         } else {
-          renderer.drawText(op.c, op.a, op.b, op.text, op.ink);
+          renderer.drawText(op.fontId, op.a, op.b, op.text, op.ink);
         }
         break;
       case Kind::DrawRect:

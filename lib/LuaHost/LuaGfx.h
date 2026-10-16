@@ -94,7 +94,12 @@ class LuaGfx {
   struct Op {
     const char* text = nullptr;       // Text only; points into stringPool
     const uint8_t* bitmap = nullptr;  // Image only: XIC payload (header stripped)
-    int16_t a = 0, b = 0, c = 0, d = 0, e = 0;  // geometry; meaning per kind
+    // Geometry: coords/sizes/radii/ids, all bounded by the screen (int16 is
+    // enough for 480x800 and for layer ids). NOT for font ids: those are 32-bit
+    // hashes from fontIds.h and truncating one makes drawText find no font and
+    // drop the text silently — hence the dedicated field.
+    int16_t a = 0, b = 0, c = 0, d = 0, e = 0;
+    int32_t fontId = 0;  // Text only
     uint8_t kind = 0;
     bool ink = true;
   };
