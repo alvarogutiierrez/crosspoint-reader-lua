@@ -152,23 +152,24 @@ void LuaGfx::apply() {
         break;
       case Kind::DrawCircle:
       case Kind::FillCircle: {
-        // No public circle primitive on GfxRenderer rasterize here with the
-        // midpoint circle algorithm against drawPixel/fillRect rows. The ink
-        // flag is fixed at queue time so evaluation stays on the queue path.
+        // GfxRenderer has no circle primitive. The FILL is an exact scan (for
+        // every row |dy| <= r the span is |dx| <= isqrt(r^2 - dy^2)): a
+        // Bresenham 8-octant disc comes out ~1px fat along the diagonals, which
+        // shows up as the corners of a rounded frame/button protruding past
+        // their straight 3px band — visible on capsules, invisible at small
+        // radii.
         const int r = op.c > 0 ? op.c : 1;
-        const bool fill = op.kind == Kind::FillCircle;
-        int x = r, y = 0, err = 1 - r;
-        while (x >= y) {
-          if (fill) {
-            for (int xx = op.a - x; xx <= op.a + x; ++xx) {
-              renderer.drawPixel(xx, op.b + y, op.ink);
-              renderer.drawPixel(xx, op.b - y, op.ink);
-            }
-            for (int xx = op.a - y; xx <= op.a + y; ++xx) {
-              renderer.drawPixel(xx, op.b + x, op.ink);
-              renderer.drawPixel(xx, op.b - x, op.ink);
-            }
-          } else {
+        if (op.kind == Kind::FillCircle) {
+          for (int dy = -r; dy <= r; ++dy) {
+            const int inside = r * r - dy * dy;
+            int dx = r;
+            while (dx > 0 && dx * dx > inside) --dx;
+            renderer.fillRect(op.a - dx, op.b + dy, 2 * dx + 1, 1, op.ink);
+          }
+        } else {
+          // 1px outline: midpoint circle over the 8 octants.
+          int x = r, y = 0, err = 1 - r;
+          while (x >= y) {
             renderer.drawPixel(op.a + x, op.b + y, op.ink);
             renderer.drawPixel(op.a - x, op.b + y, op.ink);
             renderer.drawPixel(op.a + x, op.b - y, op.ink);
@@ -177,13 +178,13 @@ void LuaGfx::apply() {
             renderer.drawPixel(op.a - y, op.b + x, op.ink);
             renderer.drawPixel(op.a + y, op.b - x, op.ink);
             renderer.drawPixel(op.a - y, op.b - x, op.ink);
-          }
-          ++y;
-          if (err < 0) {
-            err += 2 * y + 1;
-          } else {
-            --x;
-            err += 2 * (y - x) + 1;
+            ++y;
+            if (err < 0) {
+              err += 2 * y + 1;
+            } else {
+              --x;
+              err += 2 * (y - x) + 1;
+            }
           }
         }
         break;

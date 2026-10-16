@@ -13,6 +13,13 @@
 #define UI_12_FONT_ID (1831230762)
 #define SMALL_FONT_ID (1465627787)
 
+// XTApp app-text font. Apps written in XTApp Studio lay their screens out
+// against a 12px-per-character monospace metric (their CH_W / LINE_H
+// constants), so Lua apps render with this instead of the (proportional,
+// 2x-taller) UI font: with UI_12 every label came out oversized and the
+// app's own centering math landed off-centre.
+#define APPMONO_10_FONT_ID (-128796587)
+
 // Font ID 0 is reserved as the "not found" sentinel.
 // Guard against any hash accidentally producing 0.
 static_assert(NOTOSERIF_12_FONT_ID != 0, "Font ID collision with sentinel");

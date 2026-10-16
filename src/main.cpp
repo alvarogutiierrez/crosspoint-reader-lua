@@ -136,6 +136,11 @@ EpdFont ui12RegularFont(&ubuntu_12_regular);
 EpdFont ui12BoldFont(&ubuntu_12_bold);
 EpdFontFamily ui12FontFamily(&ui12RegularFont, &ui12BoldFont);
 
+// XTApp app text: monospace, 12.5px advance — the metric XTApp Studio apps
+// lay their screens out against (see APPMONO_10_FONT_ID in fontIds.h).
+EpdFont appmono10Font(&appmono_10);
+EpdFontFamily appmono10FontFamily(&appmono10Font);
+
 // Definitions for SilentRestart.h. RTC_NOINIT survives ESP.restart() but not power loss.
 RTC_NOINIT_ATTR uint32_t silentRebootMagic;
 RTC_NOINIT_ATTR uint32_t silentRebootTarget;
@@ -419,6 +424,7 @@ void setupDisplayAndFonts(bool seamless = false) {
 #endif  // OMIT_FONTS
   renderer.insertFont(UI_10_FONT_ID, ui10FontFamily);
   renderer.insertFont(UI_12_FONT_ID, ui12FontFamily);
+  renderer.insertFont(APPMONO_10_FONT_ID, appmono10FontFamily);
   renderer.insertFont(SMALL_FONT_ID, smallFontFamily);
 
   // Discover and load SD card fonts

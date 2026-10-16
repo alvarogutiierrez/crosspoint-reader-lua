@@ -33,8 +33,11 @@ class LuaAppActivity : public Activity {
         .invalidate = [](void* user) { static_cast<Activity*>(user)->requestUpdate(); },
         .user = static_cast<void*>(this)});
     // LuaGfx queues text with a font id the renderer resolves through its font
-    // map: without a real id the texts are dropped silently.
-    if (host != nullptr) host->setDefaultFont(UI_12_FONT_ID);
+    // map: without a real id the texts are dropped silently. Apps lay out
+    // against a 12px-advance monospace metric, so APPMONO_10 (12.5px advance)
+    // is their font — UI_12 is proportional and ~2x taller, which made every
+    // label oversized and threw the apps' own centring off.
+    if (host != nullptr) host->setDefaultFont(APPMONO_10_FONT_ID);
   }
 
   void onEnter() override {
@@ -116,8 +119,11 @@ class LuaAppActivity : public Activity {
     }
   }
 
-  void dispatchInput();
+  bool dispatchInput();
   void runTick(uint32_t nowMs);
+
+  // Input-coalescing window: keystrokes closer than this fold into one frame.
+  static constexpr uint32_t kInputSettleMs = 50;
 
   ActivityManager& manager;
   std::unique_ptr<ScriptHost> host;
@@ -125,4 +131,5 @@ class LuaAppActivity : public Activity {
   std::string loadErr;
   bool loadFailed = false;
   uint32_t lastTickMs = 0;
+  uint32_t lastInputMs = 0;
 };

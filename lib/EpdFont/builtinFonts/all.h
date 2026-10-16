@@ -16,6 +16,7 @@
 #include <builtinFonts/notoserif_18_bolditalic.h>
 #include <builtinFonts/notoserif_18_italic.h>
 #include <builtinFonts/notoserif_18_regular.h>
+#include <builtinFonts/appmono_10.h>
 #include <builtinFonts/notosans_8_regular.h>
 #include <builtinFonts/notosans_12_bold.h>
 #include <builtinFonts/notosans_12_bolditalic.h>
