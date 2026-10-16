@@ -47,8 +47,20 @@ class HomeActivity final : public Activity {
   void buildFlow();
   void flowMove(int delta);
   const RecentBook* flowCurrent() const;
+  // The carousel's geometry, shared by the drawing and the touch targets so a
+  // tap lands on what is actually painted.
+  struct FlowGeom {
+    int coverTop = 0;
+    int coverH = 0;
+    int coverW = 0;
+    int coverX = 0;
+    int bandTop = 0;  // below this is "travel down to the home"
+  };
+  FlowGeom flowGeometry() const;
+  int flowCoverHeight() const;
   void drawFlow();
   void drawFlowCover(const RecentBook& book, Rect rect, int thumbHeight, bool centre);
+  void drawFlowChevron(int centreX, int y);
   void roundCoverCorners(Rect rect, int radius);
   const HomeMenuItem initialMenuItem;
   const bool cleanInitialRefresh;

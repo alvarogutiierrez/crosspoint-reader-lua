@@ -359,6 +359,17 @@ void HomeActivity::loop() {
   // below — the wide chevron under the carousel is what says so. It is checked
   // before the theme branches so it works with every theme.
   if (flowActive && flowHasBooks()) {
+    const FlowGeom geom = flowGeometry();
+    int tapX = 0;
+    int tapY = 0;
+    const bool tapped = mappedInput.wasScreenTapped(tapX, tapY);
+    // A tap in the band below the cover is the chevron: that is where the tap
+    // target lives, and it must beat the key/zone order below.
+    if (tapped && tapY >= geom.bandTop) {
+      flowActive = false;
+      requestUpdate();
+      return;
+    }
     if (mappedInput.wasPressed(MappedInputManager::Button::Down) || swipe == MappedInputManager::SwipeDir::Up) {
       flowActive = false;
       requestUpdate();
@@ -377,6 +388,22 @@ void HomeActivity::loop() {
     if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
       const RecentBook* flowBook = flowCurrent();
       if (flowBook != nullptr) onSelectBook(flowBook->path);
+      return;
+    }
+    if (tapped) {
+      // The outer thirds walk the carousel, the middle opens the book. Without
+      // this the tap fell through to the menu behind and activated whatever row
+      // sat at that height.
+      const int third = renderer.getScreenWidth() / 3;
+      if (tapX < third) {
+        flowMove(-1);
+      } else if (tapX > 2 * third) {
+        flowMove(1);
+      } else {
+        const RecentBook* flowBook = flowCurrent();
+        if (flowBook != nullptr) onSelectBook(flowBook->path);
+      }
+      requestUpdate();
       return;
     }
     // Nothing on this page consumed the event: fall through so Back still opens
@@ -524,11 +551,10 @@ void HomeActivity::render(RenderLock&&) {
       firstRenderDone = true;
       requestUpdate();
     } else if (!recentsLoaded && !recentsLoading) {
-      // The carousel draws the same thumbs the home's cover tile does; generate
-      // the missing ones once and let the next pass draw them.
+      // The carousel draws its own (bigger) cover size, so the thumbs for it are
+      // generated once here and the next pass draws them.
       recentsLoading = true;
-      const int themeThumb = GUI.homeCoverThumbHeight(renderer);
-      loadRecentCovers(themeThumb > 0 ? themeThumb : metrics.homeCoverHeight);
+      loadRecentCovers(flowCoverHeight());
     }
     return;
   }
@@ -662,13 +688,34 @@ const RecentBook* HomeActivity::flowCurrent() const {
   return &flowBooks[flowIndex];
 }
 
-void HomeActivity::drawFlowCover(const RecentBook& book, const Rect rect, const int thumbHeight, const bool centre) {
-  // Shadow, then the thumb: same source and size as the home's own cover tile,
-  // so the thumbs are generated once and reused by both pages.
-  const int off = centre ? 3 : 2;
-  renderer.drawRect(rect.x + rect.width, rect.y + off, off, rect.height, true);
-  renderer.drawRect(rect.x + off, rect.y + rect.height, rect.width, off, true);
+int HomeActivity::flowCoverHeight() const {
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  // Between the title line and the travel band at the bottom.
+  const int top = metrics.homeTopPadding + 36;
+  const int bottom = renderer.getScreenHeight() - metrics.buttonHintsHeight - 54;
+  const int room = std::max(80, bottom - top);
+  // The centre cover may take ~2/3 of the width, so its 2:3 aspect caps the
+  // height: the neighbours keep a visible strip at each edge, which is what
+  // makes it read as a carousel instead of one lonely cover.
+  const int maxW = renderer.getScreenWidth() * 66 / 100;
+  return std::min(room, maxW * 3 / 2);
+}
 
+HomeActivity::FlowGeom HomeActivity::flowGeometry() const {
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  FlowGeom g;
+  g.coverH = flowCoverHeight();
+  g.coverW = std::max(1, g.coverH * 2 / 3);
+  g.coverTop = metrics.homeTopPadding + 36;
+  g.coverX = (renderer.getScreenWidth() - g.coverW) / 2;
+  g.bandTop = g.coverTop + g.coverH + 4;
+  return g;
+}
+
+void HomeActivity::drawFlowCover(const RecentBook& book, const Rect rect, const int thumbHeight, const bool centre) {
+  // No frame and no hard shadow: a 1px outline around a cover reads as a stray
+  // border (it looked like a rendering artefact on the device). The cover is
+  // drawn clean, cropped to fill by the theme's own blit.
   bool drawn = false;
   const std::string thumb = UITheme::getCoverThumbPath(book.coverBmpPath, thumbHeight);
   if (!thumb.empty()) {
@@ -682,8 +729,19 @@ void HomeActivity::drawFlowCover(const RecentBook& book, const Rect rect, const 
     }
   }
   if (!drawn) GUI.drawCoverPlaceholder(renderer, rect);
-  renderer.drawRect(rect.x, rect.y, rect.width, rect.height, 1, true);
-  if (centre) roundCoverCorners(rect, 10);
+  // Only the centre cover is rounded; the neighbours are clipped by the panel
+  // edge anyway and the carve is the one place pixels are touched one by one.
+  if (centre) roundCoverCorners(rect, 14);
+}
+
+void HomeActivity::drawFlowChevron(const int centreX, const int y) {
+  // Small, discreet and flat, hugging the bottom of the screen: bold (3px) but
+  // a wide vertex angle, so it hints "there is more below" instead of shouting.
+  constexpr int HALF_SPAN = 26;
+  constexpr int DROP = 12;
+  constexpr int WEIGHT = 3;
+  renderer.drawLine(centreX - HALF_SPAN, y, centreX, y + DROP, WEIGHT, true);
+  renderer.drawLine(centreX, y + DROP, centreX + HALF_SPAN, y, WEIGHT, true);
 }
 
 void HomeActivity::roundCoverCorners(const Rect rect, const int radius) {
@@ -718,52 +776,49 @@ void HomeActivity::roundCoverCorners(const Rect rect, const int radius) {
 void HomeActivity::drawFlow() {
   if (flowBooks.empty()) return;
   const auto& metrics = UITheme::getInstance().getMetrics();
-  const Rect content = UITheme::getInstance().getContentArea(renderer);
-  const int pageWidth = renderer.getScreenWidth();
   if (flowIndex >= static_cast<int>(flowBooks.size())) flowIndex = static_cast<int>(flowBooks.size()) - 1;
   if (flowIndex < 0) flowIndex = 0;
   const RecentBook& book = flowBooks[flowIndex];
+  const FlowGeom g = flowGeometry();
 
-  // The same status band as every other screen, so the chrome never moves; the
-  // title of the book being shown rides in it.
-  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.homeTopPadding - metrics.topPadding},
-                 book.title.c_str(), nullptr, false);
+  // The status band, with NO title in it: the book's title is written once, on
+  // its own line under the band. A second copy over the band's rule was exactly
+  // what the reader asked to remove.
+  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, renderer.getScreenWidth(),
+                                metrics.homeTopPadding - metrics.topPadding},
+                 nullptr, nullptr, false);
+  renderer.drawCenteredText(UI_12_FONT_ID, metrics.homeTopPadding + 8, book.title.c_str());
 
-  const int themeThumbHeight = GUI.homeCoverThumbHeight(renderer);
-  const int thumbHeight = themeThumbHeight > 0 ? themeThumbHeight : metrics.homeCoverHeight;
-  const int coverW = std::max(1, thumbHeight * 2 / 3);
-  const int titleY = metrics.homeTopPadding + 8;
-  renderer.drawCenteredText(UI_12_FONT_ID, titleY, book.title.c_str());
-  const int cy = titleY + 30;
-  const int cx = content.x + (content.width - coverW) / 2;
-  const int n = static_cast<int>(flowBooks.size());
-
-  // Carousel. The neighbours draw at the SAME size as the centre cover: one
+  // Carousel. The neighbours draw at the SAME size as the centre cover — one
   // thumb size means one set of generated covers, and rescaling a dithered
-  // 1-bit cover aliases badly. They are half off the panel by design.
-  if (flowIndex > 0) drawFlowCover(flowBooks[flowIndex - 1], Rect{cx - coverW - 12, cy, coverW, thumbHeight},
-                                  thumbHeight, false);
-  if (flowIndex + 1 < n) {
-    drawFlowCover(flowBooks[flowIndex + 1], Rect{cx + coverW + 12, cy, coverW, thumbHeight}, thumbHeight, false);
+  // 1-bit cover aliases badly — and they keep a visible strip at each edge.
+  constexpr int SIDE_GAP = 6;
+  const int n = static_cast<int>(flowBooks.size());
+  if (flowIndex > 0) {
+    drawFlowCover(flowBooks[flowIndex - 1], Rect{g.coverX - SIDE_GAP - g.coverW, g.coverTop, g.coverW, g.coverH},
+                  g.coverH, false);
   }
-  drawFlowCover(book, Rect{cx, cy, coverW, thumbHeight}, thumbHeight, true);
+  if (flowIndex + 1 < n) {
+    drawFlowCover(flowBooks[flowIndex + 1], Rect{g.coverX + g.coverW + SIDE_GAP, g.coverTop, g.coverW, g.coverH},
+                  g.coverH, false);
+  }
+  drawFlowCover(book, Rect{g.coverX, g.coverTop, g.coverW, g.coverH}, g.coverH, true);
 
-  // Read percentage, when the firmware knows it, then the chevron: a WIDE
-  // two-stroke ∨, no shaft and no filled triangle, wider than the footer
-  // page-turn arrows, pointing at the home below.
+  // Read percentage when the firmware knows it, then the chevron at the very
+  // bottom of the screen — where its tap band is.
   if (flowPct[flowIndex] >= 0) {
     char pctText[16];
     snprintf(pctText, sizeof(pctText), "%d%%", flowPct[flowIndex]);
-    renderer.drawCenteredText(UI_10_FONT_ID, cy + thumbHeight + 14, pctText);
+    renderer.drawCenteredText(UI_10_FONT_ID, g.bandTop + 8, pctText);
   }
-  const int chevY = cy + thumbHeight + 44;
-  const int halfSpan = std::min(110, content.width / 4);
-  const int drop = halfSpan * 2 / 3;
-  const int midX = content.x + content.width / 2;
-  if (chevY + drop + 8 < renderer.getScreenHeight() - metrics.buttonHintsHeight) {
-    renderer.drawLine(midX - halfSpan, chevY, midX, chevY + drop, 2, true);
-    renderer.drawLine(midX, chevY + drop, midX + halfSpan, chevY, 2, true);
-  }
+  drawFlowChevron(renderer.getScreenWidth() / 2, renderer.getScreenHeight() - metrics.buttonHintsHeight - 26);
+
+  // TEMPORARY (this build only): the carousel showed ONE cover on the device and
+  // the counts are the datum I cannot see from here. Remove once reported.
+  char diag[72];
+  snprintf(diag, sizeof(diag), "recents=%u flow=%u i=%d pct=%d", static_cast<unsigned>(recentBooks.size()),
+           static_cast<unsigned>(flowBooks.size()), flowIndex, flowPct[flowIndex]);
+  renderer.drawText(UI_10_FONT_ID, 6, renderer.getScreenHeight() - metrics.buttonHintsHeight - 44, diag);
 
   const auto labels = mappedInput.mapLabels(tr(STR_RESUME), tr(STR_SELECT), tr(STR_DIR_LEFT), tr(STR_DIR_RIGHT));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
