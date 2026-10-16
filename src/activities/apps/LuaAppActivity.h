@@ -15,6 +15,9 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 
+#include <CrossPointSettings.h>
+#include <I18nKeys.h>
+
 #include <Memory.h>
 #include <ScriptHost.h>
 
@@ -47,6 +50,10 @@ class LuaAppActivity : public Activity {
       requestUpdate();
       return;
     }
+    // ctx.i18n.locale comes from the UI language; the lib cannot reach
+    // CrossPointSettings, so the activity injects it (same as the font id).
+    const uint8_t lang = SETTINGS.language;
+    host->setLocaleCode(lang < static_cast<uint8_t>(Language::_COUNT) ? LANGUAGE_CODES[lang] : "en");
     if (!host->load(appName)) {
       loadErr = host->loadError();
       loadFailed = true;
@@ -87,6 +94,11 @@ class LuaAppActivity : public Activity {
       if (!luaErr.empty()) {
         drawWrapped(UI_10_FONT_ID, 8, top + 12, 14, renderer.getScreenWidth() - 16, luaErr);
       }
+    }
+    // ctx.display:full_refresh(): hand the next flush a full waveform.
+    if (host != nullptr && host->loaded() && host->wantsFullRefresh()) {
+      host->clearFullRefresh();
+      renderer.promoteNextRefresh(HalDisplay::FULL_REFRESH);
     }
     renderer.displayBuffer();
   }
@@ -132,4 +144,6 @@ class LuaAppActivity : public Activity {
   bool loadFailed = false;
   uint32_t lastTickMs = 0;
   uint32_t lastInputMs = 0;
+  int lastTouchX = 0;
+  int lastTouchY = 0;
 };

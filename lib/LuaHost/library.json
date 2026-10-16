@@ -1,0 +1,20 @@
+{
+  "name": "LuaHost",
+  "version": "0.1.0",
+  "description": "Lua 5.5.1 app host: script lifecycle, g drawing bindings, ctx screen/state bindings.",
+  "license": "MIT",
+  "build": {
+    "flags": [
+      "-DLUA_32BITS"
+    ],
+    "srcFilter": [
+      "+<LuaGfx.cpp>",
+      "+<ScriptHost.cpp>",
+      "+<lua/*.c>"
+    ]
+  },
+  "dependencies": [
+    "GfxRenderer",
+    "Logging"
+  ]
+}
