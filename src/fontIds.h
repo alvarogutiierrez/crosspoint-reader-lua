@@ -20,6 +20,12 @@
 // app's own centering math landed off-centre.
 #define APPMONO_10_FONT_ID (1945227282)
 
+// 2.x system faces (ctx.fonts.small / medium / large). Apps position text
+// against font.line_height, so each size is a real face: 8pt (advanceY 19),
+// 10pt (24, the contract's medium) and 12pt (29).
+#define APPMONO_8_FONT_ID (2087782448)
+#define APPMONO_12_FONT_ID (1407408420)
+
 // Font ID 0 is reserved as the "not found" sentinel.
 // Guard against any hash accidentally producing 0.
 static_assert(NOTOSERIF_12_FONT_ID != 0, "Font ID collision with sentinel");

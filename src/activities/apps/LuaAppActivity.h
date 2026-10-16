@@ -40,7 +40,13 @@ class LuaAppActivity : public Activity {
     // against a 12px-advance monospace metric, so APPMONO_10 (12.5px advance)
     // is their font — UI_12 is proportional and ~2x taller, which made every
     // label oversized and threw the apps' own centring off.
-    if (host != nullptr) host->setDefaultFont(APPMONO_10_FONT_ID);
+    if (host != nullptr) {
+      host->setDefaultFont(APPMONO_10_FONT_ID);
+      // ctx.fonts.small / medium / large (contract section 7): the three mono
+      // faces the firmware ships, so an app that asks for a size gets that size
+      // (and the line_height it reads back is the one it will be drawn with).
+      host->setFontIds(APPMONO_8_FONT_ID, APPMONO_10_FONT_ID, APPMONO_12_FONT_ID);
+    }
   }
 
   void onEnter() override {
@@ -142,6 +148,9 @@ class LuaAppActivity : public Activity {
   std::string appName;
   std::string loadErr;
   bool loadFailed = false;
+  // A long Back press already exited: the release that follows is swallowed so
+  // it cannot reach the app as a second "go back a page".
+  bool backLongPress = false;
   uint32_t lastTickMs = 0;
   uint32_t lastInputMs = 0;
   int lastTouchX = 0;

@@ -124,6 +124,11 @@ static const char* gfxImageKey(lua_State* L, int idx) {
     lua_getfield(L, idx, "asset_key");
     if (!lua_isstring(L, -1)) {
       lua_pop(L, 1);
+      // ctx.package:image object (2.x): the table carries its asset key.
+      lua_getfield(L, idx, "key");
+    }
+    if (!lua_isstring(L, -1)) {
+      lua_pop(L, 1);
       lua_getfield(L, idx, "handle");
     }
     const char* k = lua_isstring(L, -1) ? lua_tostring(L, -1) : nullptr;
@@ -1089,6 +1094,123 @@ const luaL_Reg lockFuncs[] = {
 const luaL_Reg assetsFuncs[] = {
     {"evict", assets_evict}, {"info", assets_info}, {"handle", assets_handle}, {nullptr, nullptr},
 };
+// --- ctx.fonts (2.x contract, section 7) ------------------------------------
+//
+// A font object is a plain table: { id, name, line_height, ascent, measure }.
+// The metrics come from the renderer for the injected id, so an app's own
+// centring math lands exactly where the text is drawn.
+int font_measure(lua_State* L) {
+  ScriptHost* host = hostOf(L);
+  const int base = lua_type(L, 1) == LUA_TTABLE ? 2 : 1;  // font:measure(text)
+  const char* s = luaL_checkstring(L, base);
+  int id = host != nullptr ? host->defaultFontId : 0;
+  if (lua_istable(L, 1)) {
+    lua_getfield(L, 1, "id");
+    if (lua_isnumber(L, -1)) id = static_cast<int>(lua_tointeger(L, -1));
+    lua_pop(L, 1);
+  }
+  lua_pushinteger(L, host != nullptr ? host->textWidth(id, s) : 0);
+  return 1;
+}
+
+void pushFontObject(lua_State* L, ScriptHost* host, const char* name, int id) {
+  lua_createtable(L, 0, 5);
+  lua_pushinteger(L, id);
+  lua_setfield(L, -2, "id");
+  lua_pushstring(L, name);
+  lua_setfield(L, -2, "name");
+  lua_pushinteger(L, host->lineHeightOf(id));
+  lua_setfield(L, -2, "line_height");
+  lua_pushinteger(L, host->ascenderOf(id));
+  lua_setfield(L, -2, "ascent");
+  lua_pushcfunction(L, font_measure);
+  lua_setfield(L, -2, "measure");
+}
+
+// --- ctx.package (2.x contract, section 8) ----------------------------------
+//
+// Package images are the XIC files the manifest preloads. The object a script
+// gets is a table carrying the asset key; g:image accepts it (or the 0.8 bare
+// key string) and the size comes from the decoded asset.
+int pkg_image_release(lua_State* L);
+
+int pkg_image(lua_State* L) {
+  ScriptHost* host = hostOf(L);
+  const int base = lua_type(L, 1) == LUA_TTABLE ? 2 : 1;
+  const char* key = luaL_checkstring(L, base);
+  if (host == nullptr || key == nullptr || strchr(key, '/') != nullptr ||
+      strstr(key, "..") != nullptr) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "invalid_argument");
+    return 2;
+  }
+  const int w = host->imageWidth(key);
+  const int h = host->imageHeight(key);
+  if (w <= 0 || h <= 0) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "not_found");
+    return 2;
+  }
+  lua_createtable(L, 0, 5);
+  lua_pushliteral(L, "image");
+  lua_setfield(L, -2, "__kind");
+  lua_pushstring(L, key);
+  lua_setfield(L, -2, "key");
+  lua_pushinteger(L, w);
+  lua_setfield(L, -2, "width");
+  lua_pushinteger(L, h);
+  lua_setfield(L, -2, "height");
+  lua_pushcfunction(L, pkg_image_release);
+  lua_setfield(L, -2, "release");
+  return 1;
+}
+
+int pkg_image_release(lua_State* L) {
+  ScriptHost* host = hostOf(L);
+  const char* key = nullptr;
+  if (lua_istable(L, 1)) {
+    lua_getfield(L, 1, "key");
+    if (lua_isstring(L, -1)) key = lua_tostring(L, -1);
+  }
+  // Drops the decoded asset; the object stays readable and can be drawn again
+  // (the host re-decodes it), so releasing twice is harmless.
+  if (host != nullptr && key != nullptr) host->evictAsset(key);
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+int pkg_exists(lua_State* L) {
+  ScriptHost* host = hostOf(L);
+  const int base = lua_type(L, 1) == LUA_TTABLE ? 2 : 1;
+  const char* name = luaL_checkstring(L, base);
+  lua_pushboolean(L, (host != nullptr && name != nullptr && host->imageWidth(name) > 0) ? 1 : 0);
+  return 1;
+}
+
+int pkg_cache_stats(lua_State* L) {
+  ScriptHost* host = hostOf(L);
+  lua_createtable(L, 0, 3);
+  lua_pushinteger(L, host != nullptr ? host->assetCount() : 0);
+  lua_setfield(L, -2, "count");
+  lua_pushinteger(L, 320);  // the contract's ceiling, reported as the host limit
+  lua_setfield(L, -2, "limit");
+  lua_pushinteger(L, host != nullptr ? static_cast<lua_Integer>(host->assetBytes()) : 0);
+  lua_setfield(L, -2, "bytes");
+  return 1;
+}
+
+const luaL_Reg packageFuncs[] = {
+    {"image", pkg_image},
+    {"exists", pkg_exists},
+    {"cache_stats", pkg_cache_stats},
+    // The manifest's read-only data files (section 8): the same implementations
+    // ctx.data already exposes for 0.8 apps.
+    {"size", data_size},
+    {"read", data_read_text},
+    {"open_text", data_open_text},
+    {nullptr, nullptr},
+};
+
 // --- ctx.storage / ctx.json (2.x contract, sections 9-10) -------------------
 // (appendJsonString lives with the state writer further down.)
 void appendJsonString(std::string& out, const char* s, size_t len);
@@ -2136,6 +2258,9 @@ bool ScriptHost::preloadAssets() {
   // validates names against that list, and ctx.net exists only with net.http.
   permissions.clear();
   dataFiles.clear();
+  // api: "2.1" -> the 2.x event contract (see ScriptHost::api2x).
+  const char* apiVer = doc["api"].as<const char*>();
+  api2x = (apiVer != nullptr) && apiVer[0] == '2';
   for (JsonVariantConst v : doc["permissions"].as<JsonArrayConst>()) {
     if (v.is<const char*>()) permissions.push_back(v.as<const char*>());
   }
@@ -2524,6 +2649,24 @@ bool ScriptHost::load(const std::string& name) {
   pushJsonNull(L);
   lua_setfield(L, -2, "null");
   lua_setfield(L, -2, "json");
+  // ctx.fonts (section 7): the three system faces, each with its real metrics.
+  lua_newtable(L);
+  if (fontIdSmall != 0) {
+    pushFontObject(L, this, "small", fontIdSmall);
+    lua_setfield(L, -2, "small");
+  }
+  if (fontIdMedium != 0) {
+    pushFontObject(L, this, "medium", fontIdMedium);
+    lua_setfield(L, -2, "medium");
+  }
+  if (fontIdLarge != 0) {
+    pushFontObject(L, this, "large", fontIdLarge);
+    lua_setfield(L, -2, "large");
+  }
+  lua_setfield(L, -2, "fonts");
+  // ctx.package (section 8): the preloaded XIC images + the manifest's data files.
+  luaL_newlib(L, packageFuncs);
+  lua_setfield(L, -2, "package");
 
   // --- the rest of the 0.8 surface, as namespaces on ctx -------------------
   luaL_newlib(L, sysFuncs);
@@ -2721,7 +2864,10 @@ bool ScriptHost::onInput(const LuaInputEvent& ev) {
   lua_getglobal(L, "ctx");
   lua_newtable(L);
   if (ev.isTouch) {
-    lua_pushliteral(L, "touch");
+    // Section 19: a 2.x package sees ev.type == "pointer", a 0.x/1.x package the
+    // name it was written against ("touch"). Everything else in the event is the
+    // same table for both.
+    lua_pushstring(L, api2x ? "pointer" : "touch");
     lua_setfield(L, -2, "type");
     const char* gesture = "tap";
     switch (ev.gesture) {
@@ -2739,9 +2885,16 @@ bool ScriptHost::onInput(const LuaInputEvent& ev) {
     lua_setfield(L, -2, "x");
     lua_pushinteger(L, ev.y);
     lua_setfield(L, -2, "y");
+    // A hold fires while the finger is down; a tap/swipe is release-driven.
+    lua_pushstring(L, ev.phaseUp ? "up" : "hold");
+    lua_setfield(L, -2, "phase");
   } else {
     lua_pushliteral(L, "key");
     lua_setfield(L, -2, "type");
+    // 2.x: phase down/up, one pair per press. `state` is the 0.8 field name and
+    // stays populated so an old app reading it keeps working.
+    lua_pushstring(L, ev.phaseUp ? "up" : "down");
+    lua_setfield(L, -2, "phase");
     lua_pushliteral(L, "down");
     lua_setfield(L, -2, "state");
     // XTApp key model: a single ev.key string, not per-key booleans.

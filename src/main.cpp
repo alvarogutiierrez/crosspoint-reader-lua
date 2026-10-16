@@ -140,6 +140,11 @@ EpdFontFamily ui12FontFamily(&ui12RegularFont, &ui12BoldFont);
 // lay their screens out against (see APPMONO_10_FONT_ID in fontIds.h).
 EpdFont appmono10Font(&appmono_10);
 EpdFontFamily appmono10FontFamily(&appmono10Font);
+// The other two system faces for XTApp 2.x apps (ctx.fonts.small / large).
+EpdFont appmono8Font(&appmono_8);
+EpdFontFamily appmono8FontFamily(&appmono8Font);
+EpdFont appmono12Font(&appmono_12);
+EpdFontFamily appmono12FontFamily(&appmono12Font);
 
 // Definitions for SilentRestart.h. RTC_NOINIT survives ESP.restart() but not power loss.
 RTC_NOINIT_ATTR uint32_t silentRebootMagic;
@@ -425,6 +430,8 @@ void setupDisplayAndFonts(bool seamless = false) {
   renderer.insertFont(UI_10_FONT_ID, ui10FontFamily);
   renderer.insertFont(UI_12_FONT_ID, ui12FontFamily);
   renderer.insertFont(APPMONO_10_FONT_ID, appmono10FontFamily);
+  renderer.insertFont(APPMONO_8_FONT_ID, appmono8FontFamily);
+  renderer.insertFont(APPMONO_12_FONT_ID, appmono12FontFamily);
   renderer.insertFont(SMALL_FONT_ID, smallFontFamily);
 
   // Discover and load SD card fonts

@@ -29,6 +29,9 @@ struct LuaInputEvent {
   int y = 0;
   // ev.time_ms: monotonic ms when the event was delivered (XTApp exposes it).
   uint32_t timeMs = 0;
+  // 2.x key events come in down/up pairs (contract section 4) and only the `up`
+  // of Back decides whether the app exits; 0.8 apps get one event per press.
+  bool phaseUp = false;
   LuaGesture gesture = LuaGesture::Tap;
   // Key flags: exactly one is true for key events.
   bool keyBack = false;
@@ -155,6 +158,21 @@ class ScriptHost {
   // skipped, which is what silently hid every label before).
   void setDefaultFont(int id) { defaultFontId = id; }
   int defaultFontId = 0;
+  // Set from the manifest's `api` field at load: the event contract the app was
+  // written against (section 19 — a host runs 0.x/1.x packages under their own
+  // old contract). The only place the two spell the same thing differently is
+  // the pointer event's type: "pointer" in 2.x, "touch" before it.
+  bool api2x = false;
+  // ctx.fonts.small / medium / large (contract section 7). The activity injects
+  // the three ids; 0 means "not available" and that entry is omitted.
+  void setFontIds(int small, int medium, int large) {
+    fontIdSmall = small;
+    fontIdMedium = medium;
+    fontIdLarge = large;
+  }
+  int fontIdSmall = 0;
+  int fontIdMedium = 0;
+  int fontIdLarge = 0;
   // Text metrics for the 2.x text options (font:measure / line_height / ascent).
   // The lib cannot reach the renderer's font map itself, so these wrap the
   // renderer's own metrics for the injected font ids.
