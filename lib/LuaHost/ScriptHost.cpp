@@ -12,6 +12,8 @@
 
 #include <NetworkClient.h>
 
+#include <NetworkClient.h>
+
 #include <BatteryMonitor.h>
 #include <HalClock.h>
 #include <HalPowerManager.h>
@@ -1027,6 +1029,47 @@ std::string netReadLine(NetworkClient& c, uint32_t timeoutMs) {
   return line;
 }
 
+
+// Minimal HTTP/1.1 client over the Arduino NetworkClient. The doc guarantees
+// http:// only (net.http), which is exactly what a plain TCP client covers;
+// https:// answers "unsupported_scheme" instead of pretending.
+bool parseHttpUrl(const std::string& url, std::string& host, uint16_t& port, std::string& path) {
+  if (url.rfind("http://", 0) != 0) return false;
+  const std::string rest = url.substr(7);
+  const size_t slash = rest.find('/');
+  const std::string authority = (slash == std::string::npos) ? rest : rest.substr(0, slash);
+  path = (slash == std::string::npos) ? "/" : rest.substr(slash);
+  host = authority;
+  port = 80;
+  const size_t colon = authority.find(':');
+  if (colon != std::string::npos) {
+    host = authority.substr(0, colon);
+    port = static_cast<uint16_t>(atoi(authority.substr(colon + 1).c_str()));
+  }
+  return !host.empty() && port > 0;
+}
+
+// Reads one CRLF line (without the CRLF); empty string on timeout/close.
+std::string netReadLine(NetworkClient& c, uint32_t timeoutMs) {
+  std::string line;
+  const uint32_t start = millis();
+  while (millis() - start < timeoutMs) {
+    if (!c.connected() && !c.available()) break;
+    const int ch = c.read();
+    if (ch < 0) {
+      delay(1);
+      continue;
+    }
+    if (ch == '\n') {
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      return line;
+    }
+    line.push_back(static_cast<char>(ch));
+    if (line.size() > 2048) break;
+  }
+  return line;
+}
+
 void netWorkerTask(void* arg) {
   ScriptHost::NetTask* t = static_cast<ScriptHost::NetTask*>(arg);
   if (!t->cancelled) {
@@ -1291,9 +1334,36 @@ int ctx_set_tick_rate(lua_State* L) {
   return 0;
 }
 
+int ctx_quit(lua_State* L) {
+  ScriptHost* host = hostOf(L);
+  if (host != nullptr) {
+    host->requestQuit();
+    LOG_INF("LUAHOST", " ctx:quit() requested");
+  }
+  return 0;
+}
+
+int ctx_request_refresh(lua_State* L) {
+  // "solo una intencion; el sistema sigue eligiendo la forma de onda": taken as a
+  // repaint request, not as a refresh-mode decision.
+  ScriptHost* host = hostOf(L);
+  if (host != nullptr) host->requestInvalidate();
+  return 0;
+}
+
+int ctx_save(lua_State* L) {
+  ScriptHost* host = hostOf(L);
+  if (host != nullptr) host->saveState();
+  lua_pushboolean(L, host != nullptr ? 1 : 0);
+  return 1;
+}
+
 const luaL_Reg ctxFuncs[] = {
     {"invalidate", ctx_invalidate},
     {"set_tick_rate", ctx_set_tick_rate},
+    {"quit", ctx_quit},
+    {"request_refresh", ctx_request_refresh},
+    {"save", ctx_save},
     {nullptr, nullptr},
 };
 
@@ -1803,6 +1873,54 @@ int ScriptHost::netStart(const char* url, const char* body, const char* headers)
   return slot;
 }
 
+bool ScriptHost::hasPermission(const char* perm) const {
+  if (perm == nullptr) return false;
+  for (const std::string& p : permissions) {
+    if (p == perm) return true;
+  }
+  return false;
+}
+
+int ScriptHost::netStart(const char* url, const char* body, const char* headers) {
+  if (url == nullptr || url[0] == '\0') return -1;
+  int slot = -1;
+  for (int i = 0; i < MAX_NET_TASKS; ++i) {
+    if (netTasks[i] == nullptr) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot < 0) {
+    // Reclaim the oldest finished task rather than refusing a new request.
+    for (int i = 0; i < MAX_NET_TASKS; ++i) {
+      if (netTasks[i] != nullptr && netTasks[i]->done) {
+        delete netTasks[i];
+        netTasks[i] = nullptr;
+        slot = i;
+        break;
+      }
+    }
+  }
+  if (slot < 0) return -1;
+  NetTask* t = new (std::nothrow) NetTask();
+  if (t == nullptr) return -1;
+  t->url = url;
+  if (body != nullptr) {
+    const size_t n = strlen(body);
+    t->reqBody.assign(body, n < MAX_NET_REQUEST ? n : MAX_NET_REQUEST);
+  }
+  if (headers != nullptr) t->headers = headers;
+  t->started = true;
+  netTasks[slot] = t;
+  if (xTaskCreatePinnedToCore(netWorkerTask, "xtnet", 8192, t, 1, nullptr, tskNO_AFFINITY) != pdPASS) {
+    netTasks[slot] = nullptr;
+    delete t;
+    return -1;
+  }
+  LOG_INF("LUAHOST", " net task %d: %s", slot, url);
+  return slot;
+}
+
 bool ScriptHost::load(const std::string& name) {
   app = name;
   appPathV = std::string("/apps/") + name + "/";
@@ -1943,6 +2061,8 @@ bool ScriptHost::load(const std::string& name) {
   luaL_newlib(L, lockFuncs);
   lua_pushstring(L, "none");
   lua_setfield(L, -2, "reason");
+  lua_pushnil(L);
+  lua_setfield(L, -2, "base_page");
   lua_pushinteger(L, 0);
   lua_setfield(L, -2, "elapsed_sec");
   lua_pushinteger(L, 0);
