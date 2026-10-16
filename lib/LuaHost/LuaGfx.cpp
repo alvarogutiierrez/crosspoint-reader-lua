@@ -25,6 +25,17 @@ inline int16_t opGeom(int v) {
 }
 }  // namespace
 
+namespace {
+// Geometry values are packed into int16. Anything outside the panel's range is
+// clamped rather than wrapped (a wrapped radius would make a rasterizer loop
+// thousands of times on a value the app never meant to pass).
+inline int16_t opGeom(int v) {
+  if (v < -8192) return -8192;
+  if (v > 8192) return 8192;
+  return static_cast<int16_t>(v);
+}
+}  // namespace
+
 LuaGfx::Op* LuaGfx::nextOp() {
   if (opCount >= MAX_OPS) return nullptr;  // caller counts the drop
   const size_t used = static_cast<size_t>(opCount);
