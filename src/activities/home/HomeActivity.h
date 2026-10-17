@@ -41,6 +41,9 @@ class HomeActivity final : public Activity {
   // theme is selected. Down travels to the home below, which is untouched.
   std::vector<RecentBook> flowBooks;
   std::vector<int> flowPct;
+  // Thumbs that failed to generate this session: retrying them on every home
+  // visit is what made the loading popup reappear and left covers blank.
+  std::vector<std::string> thumbFailures;
   int flowIndex = 0;
   bool flowActive = true;
   bool flowHasBooks() const { return !flowBooks.empty(); }
@@ -61,6 +64,10 @@ class HomeActivity final : public Activity {
   int flowCoverHeight() const;
   void drawFlow();
   void drawFlowCover(const RecentBook& book, Rect rect, int thumbHeight, bool centre);
+  // Perspective side panel: the inner edge (the one touching the centre cover)
+  // is the tall one and the outer edge recedes, which is what makes the row read
+  // as a 3D carousel instead of three flat pictures.
+  void drawFlowSide(const RecentBook& book, bool left, const FlowGeom& geom);
   // Small flat bold chevron: down (∨) travels to the home, up (∧) travels back to
   // the carousel from the home.
   void drawChevron(int centreX, int y, bool up);

@@ -309,6 +309,13 @@ class GfxRenderer {
   bool drawBitmap(const Bitmap& bitmap, int x, int y, int maxWidth, int maxHeight, float cropX = 0, float cropY = 0,
                   bool whiteAsTransparent = false) const;
   bool drawBitmap1Bit(const Bitmap& bitmap, int x, int y, int maxWidth, int maxHeight) const;
+  // Draws a bitmap into a TRAPEZOID: destination column dx has height hL..hR
+  // (linear across the width), each column centred vertically in max(hL, hR).
+  // That is the perspective of the home carousel's side covers: the edge that
+  // touches the centre cover is the tall one, the outer edge recedes. Only black
+  // pixels are written, so the caller clears the area first when it must be
+  // opaque. Ported from CrossInk-Carousel's Flow theme.
+  void drawPerspectiveBitmap(const Bitmap& bitmap, int x, int y, int w, int hL, int hR) const;
   // Counter-invert content images in the logical framebuffer so output-level
   // dark mode leaves their original polarity unchanged.
   void preserveImagePolarity(int x, int y, int width, int height) const;

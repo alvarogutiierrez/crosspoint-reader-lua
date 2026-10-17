@@ -716,23 +716,35 @@ bool HomeActivity::ensureCoverThumbFor(const RecentBook& book, const int thumbHe
   if (book.coverBmpPath.empty()) return false;
   const std::string thumb = UITheme::getCoverThumbPath(book.coverBmpPath, thumbHeight);
   if (Storage.exists(thumb.c_str())) return true;
+  // A book that failed once this session is not retried on every visit: the
+  // retry loop is what showed the loading popup over and over.
+  for (const std::string& failed : thumbFailures) {
+    if (failed == thumb) return false;
+  }
+  bool ok = false;
   if (FsHelpers::hasReflowableBookExtension(book.path)) {
+    // generateThumbBmpFromSource locates the cover WITHOUT building the spine,
+    // TOC or reading caches. That metadata build was the slow part: a full
+    // epub load per book is seconds, this is a zip walk.
     Epub epub(book.path, "/.crosspoint");
-    epub.load(false, true);  // metadata only; no css
-    return epub.generateThumbBmp(thumbHeight);
-  }
-  if (FsHelpers::hasXtcExtension(book.path)) {
+    ok = epub.generateThumbBmpFromSource(thumbHeight);
+  } else if (FsHelpers::hasXtcExtension(book.path)) {
     Xtc xtc(book.path, "/.crosspoint");
-    if (!xtc.load()) return false;
-    return xtc.generateThumbBmp(thumbHeight);
+    if (xtc.load()) ok = xtc.generateThumbBmp(thumbHeight);
   }
-  return false;
+  if (!ok) {
+    thumbFailures.push_back(thumb);
+    LOG_ERR("HOME", "cover thumb failed: %s", thumb.c_str());
+  }
+  return ok;
 }
 
 void HomeActivity::flowMove(const int delta) {
   const int n = static_cast<int>(flowBooks.size());
   if (n <= 0) return;
-  flowIndex = std::max(0, std::min(n - 1, flowIndex + delta));
+  // It is a CAROUSEL, not a list: it wraps, so going left from the first book
+  // lands on the last one and the other way round.
+  flowIndex = ((flowIndex + delta) % n + n) % n;
 }
 
 const RecentBook* HomeActivity::flowCurrent() const {
@@ -787,6 +799,38 @@ void HomeActivity::drawFlowCover(const RecentBook& book, const Rect rect, const 
   // Only the centre cover is rounded, and only slightly (the reference has
   // square corners; a light radius keeps it from looking like a bare crop).
   if (centre) roundCoverCorners(rect, 8);
+}
+
+void HomeActivity::drawFlowSide(const RecentBook& book, const bool left, const FlowGeom& g) {
+  // Proportions taken from the reference Flow theme: the side panel is ~42% of
+  // the centre's width, its inner edge ~92% of the centre's height and its outer
+  // edge ~81% — that taper is the perspective.
+  const int sideW = std::max(1, g.coverW * 42 / 100);
+  const int innerH = g.coverH * 92 / 100;
+  const int outerH = g.coverH * 81 / 100;
+  const int hMax = std::max(innerH, outerH);
+  const int x = left ? (g.coverX - sideW) : (g.coverX + g.coverW);
+  const int y = g.coverTop + (g.coverH - hMax) / 2;
+
+  // The blit only writes ink, so the panel is cleared first — otherwise the
+  // cover's white areas let whatever was drawn beneath show through.
+  renderer.fillRect(x, y, sideW, hMax, false);
+  bool drawn = false;
+  const std::string thumb = UITheme::getCoverThumbPath(book.coverBmpPath, g.coverH);
+  if (!thumb.empty()) {
+    HalFile file;
+    if (Storage.openFileForRead("HOME", thumb, file)) {
+      Bitmap bitmap(file);
+      if (bitmap.parseHeaders() == BmpReaderError::Ok) {
+        // dx = 0 is the left column of the panel: on the left panel that is the
+        // OUTER edge, on the right panel it is the inner one.
+        renderer.drawPerspectiveBitmap(bitmap, x, y, sideW, left ? outerH : innerH, left ? innerH : outerH);
+        drawn = true;
+      }
+      file.close();
+    }
+  }
+  if (!drawn) renderer.fillRect(x, y, sideW, hMax, true);  // black silhouette placeholder
 }
 
 void HomeActivity::drawChevron(const int centreX, const int y, const bool up) {
@@ -846,18 +890,14 @@ void HomeActivity::drawFlow() {
                  nullptr, nullptr, false);
   renderer.drawCenteredText(UI_12_FONT_ID, metrics.homeTopPadding + 8, book.title.c_str());
 
-  // Carousel. The neighbours draw at the SAME size as the centre cover — one
-  // thumb size means one set of generated covers, and rescaling a dithered
-  // 1-bit cover aliases badly — and they TOUCH it (no gap), so the three read as
-  // one continuous surface, exactly like the reference mockup.
+  // Carousel. The centre cover is drawn last, on top; the neighbours are
+  // PERSPECTIVE panels (trapezoids: tall on the edge that touches the centre,
+  // receding outwards) and they WRAP, so the first book has the last one on its
+  // left. With a single book there is no row to draw, just the cover.
   const int n = static_cast<int>(flowBooks.size());
-  if (flowIndex > 0) {
-    drawFlowCover(flowBooks[flowIndex - 1], Rect{g.coverX - g.coverW, g.coverTop, g.coverW, g.coverH}, g.coverH,
-                  false);
-  }
-  if (flowIndex + 1 < n) {
-    drawFlowCover(flowBooks[flowIndex + 1], Rect{g.coverX + g.coverW, g.coverTop, g.coverW, g.coverH}, g.coverH,
-                  false);
+  if (n > 1) {
+    drawFlowSide(flowBooks[(flowIndex + n - 1) % n], true, g);
+    drawFlowSide(flowBooks[(flowIndex + 1) % n], false, g);
   }
   drawFlowCover(book, Rect{g.coverX, g.coverTop, g.coverW, g.coverH}, g.coverH, true);
 

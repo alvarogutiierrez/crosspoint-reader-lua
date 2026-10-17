@@ -1591,6 +1591,61 @@ bool GfxRenderer::drawBitmap1Bit(const Bitmap& bitmap, const int x, const int y,
   return true;
 }
 
+void GfxRenderer::drawPerspectiveBitmap(const Bitmap& bitmap, const int x, const int y, const int w, const int hL,
+                                        const int hR) const {
+  if (w <= 0 || hL <= 0 || hR <= 0) return;
+  const int srcW = bitmap.getWidth();
+  const int srcH = bitmap.getHeight();
+  if (srcW <= 0 || srcH <= 0) return;
+
+  const int hMax = std::max(hL, hR);
+  const int screenW = getScreenWidth();
+  const int screenH = getScreenHeight();
+  const bool topDown = bitmap.isTopDown();
+
+  // One row buffer for the 2-bit packed output plus one for the raw BMP row —
+  // the same pair drawBitmap1Bit allocates, just once for the whole blit.
+  const int outputRowSize = (srcW + 3) / 4;
+  const auto rowBytesSize = static_cast<size_t>(bitmap.getRowBytes());
+  auto rowScratch = makeUniqueNoThrow<uint8_t[]>(static_cast<size_t>(outputRowSize) + rowBytesSize);
+  if (!rowScratch) {
+    LOG_ERR("GFX", "!! Failed to allocate perspective row buffers");
+    return;
+  }
+  auto* outputRow = rowScratch.get();
+  auto* rowBytes = rowScratch.get() + outputRowSize;
+
+  // Source rows are read sequentially (a BMP reader cannot seek backwards
+  // cheaply), and each source row is stretched into the destination rows of
+  // every column, whose height varies across the width: that is the trapezoid.
+  for (int srcY = 0; srcY < srcH; srcY++) {
+    if (bitmap.readNextRow(outputRow, rowBytes) != BmpReaderError::Ok) {
+      LOG_ERR("GFX", "Failed to read row %d from bitmap (perspective)", srcY);
+      return;
+    }
+    const int srcRowIndex = topDown ? srcY : (srcH - 1 - srcY);
+
+    for (int dx = 0; dx < w; dx++) {
+      const int colH = (w == 1) ? hL : (hL + (hR - hL) * dx / (w - 1));
+      if (colH <= 0) continue;
+      const int colTop = (hMax - colH) / 2;
+      const int screenX = x + dx;
+      if (screenX < 0 || screenX >= screenW) continue;
+
+      const int srcX = (dx * srcW) / w;
+      const uint8_t val = (outputRow[srcX / 4] >> (6 - ((srcX * 2) % 8))) & 0x3;
+
+      const int dstYStart = (srcRowIndex * colH) / srcH;
+      const int dstYEnd = ((srcRowIndex + 1) * colH) / srcH;
+      for (int dy = dstYStart; dy < dstYEnd; ++dy) {
+        const int screenY = y + colTop + dy;
+        if (screenY < 0 || screenY >= screenH) continue;
+        if (val < 3) drawPixel(screenX, screenY, true);  // 1-bit source: val<3 is ink
+      }
+    }
+  }
+}
+
 void GfxRenderer::preserveImagePolarity(const int x, const int y, const int width, const int height) const {
   if (renderMode != BW || !display.isInverted() || _stripActive || !frameBuffer || width <= 0 || height <= 0) {
     return;
