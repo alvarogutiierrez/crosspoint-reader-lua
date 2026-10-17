@@ -871,11 +871,15 @@ void HomeActivity::drawFlowCover(const RecentBook& book, const Rect rect, const 
 
 void HomeActivity::drawFlowSide(const RecentBook& book, const bool left, const FlowGeom& g) {
   // Proportions taken from the reference Flow theme: the side panel is ~42% of
-  // the centre's width, its inner edge ~92% of the centre's height and its outer
-  // edge ~81% — that taper is the perspective.
+  // the centre's width and its two vertical edges differ by ~10 points — that
+  // taper is the perspective.
   const int sideW = std::max(1, g.coverW * 42 / 100);
-  const int innerH = g.coverH * 92 / 100;
-  const int outerH = g.coverH * 81 / 100;
+  // The tall edge is the OUTER one: in the reference the panels lean the other way,
+  // rotating AWAY from the centre cover and getting slightly smaller as they come
+  // closer to it (90% at the screen border, 80% where they touch the centre — a
+  // touch smaller overall than the mirrored 92/81 this replaces).
+  const int innerH = g.coverH * 80 / 100;
+  const int outerH = g.coverH * 90 / 100;
   const int hMax = std::max(innerH, outerH);
   const int x = left ? (g.coverX - sideW) : (g.coverX + g.coverW);
   const int y = g.coverTop + (g.coverH - hMax) / 2;
