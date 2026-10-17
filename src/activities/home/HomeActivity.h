@@ -68,6 +68,10 @@ class HomeActivity final : public Activity {
   // is the tall one and the outer edge recedes, which is what makes the row read
   // as a 3D carousel instead of three flat pictures.
   void drawFlowSide(const RecentBook& book, bool left, const FlowGeom& geom);
+  // Cover plumbing for the carousel: resolve a missing cover path, tell whether a
+  // thumb (of that size) is still missing, and generate it when it is.
+  bool ensureCoverThumbFor(RecentBook& book, int thumbHeight);
+  bool coverThumbMissing(const RecentBook& book, int thumbHeight) const;
   // Small flat bold chevron: down (∨) travels to the home, up (∧) travels back to
   // the carousel from the home.
   void drawChevron(int centreX, int y, bool up);

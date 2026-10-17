@@ -559,25 +559,44 @@ void HomeActivity::render(RenderLock&&) {
       firstRenderDone = true;
       requestUpdate();
     } else if (!recentsLoaded && !recentsLoading) {
-      // The carousel draws its own (bigger) cover size and its own book LIST, so
-      // the thumbs are prepared here from the same list it draws.
+      // Covers are generated ONE PER PASS, the visible books first. A thumb
+      // costs seconds (extract the cover image, dither it, write the BMP), so
+      // doing the whole list in one pass froze the UI for tens of seconds behind
+      // the loading box: that is the "loading all the time" the reader reported.
+      // One per pass keeps the buttons answering, the covers fill in as they are
+      // ready, and a book with no thumb yet simply shows the placeholder.
       recentsLoading = true;
       const int flowThumbHeight = flowCoverHeight();
-      Rect popup;
-      bool popupShown = false;
-      int done = 0;
-      for (const RecentBook& book : flowBooks) {
-        if (!popupShown) {
-          popupShown = true;
-          popup = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
-        }
-        ensureCoverThumbFor(book, flowThumbHeight);
-        ++done;
-        GUI.fillPopupProgress(renderer, popup, done * 100 / static_cast<int>(flowBooks.size()));
+      const int n = static_cast<int>(flowBooks.size());
+      // Priority: what is on screen, then its neighbours, then the rest of the
+      // row — the reader is looking at those first.
+      std::vector<int> order;
+      order.reserve(n);
+      order.push_back(flowIndex);
+      const int prevIdx = (flowIndex + n - 1) % n;
+      const int nextIdx = (flowIndex + 1) % n;
+      if (n > 1) {
+        order.push_back(prevIdx);
+        order.push_back(nextIdx);
       }
-      recentsLoaded = true;
+      for (int i = 0; i < n; ++i) {
+        if (i == flowIndex || (n > 1 && (i == prevIdx || i == nextIdx))) continue;
+        order.push_back(i);
+      }
+      int pending = -1;
+      for (const int idx : order) {
+        if (coverThumbMissing(flowBooks[idx], flowThumbHeight)) {
+          pending = idx;
+          break;
+        }
+      }
+      if (pending >= 0) {
+        ensureCoverThumbFor(flowBooks[pending], flowThumbHeight);
+        requestUpdate();  // next thumb (and the cover that just landed)
+      } else {
+        recentsLoaded = true;  // nothing left to generate: no more cover passes
+      }
       recentsLoading = false;
-      requestUpdate();
     }
     return;
   }
@@ -712,25 +731,74 @@ void HomeActivity::buildFlow() {
 // missing. Mirrors what loadRecentCovers does per recent book, but takes the
 // book as an argument so the carousel can prepare its own (bigger) thumbs
 // without dragging the whole recents list along.
-bool HomeActivity::ensureCoverThumbFor(const RecentBook& book, const int thumbHeight) {
-  if (book.coverBmpPath.empty()) return false;
+bool HomeActivity::coverThumbMissing(const RecentBook& book, const int thumbHeight) const {
+  // A book we already gave up on this session is not pending work: retrying is
+  // what kept the loading box coming back.
+  for (const std::string& failed : thumbFailures) {
+    if (failed == book.path) return false;  // no cover path to be had
+  }
+  // No cover path (yet): there is work to do, but only the pass below knows how
+  // to resolve it.
+  if (book.coverBmpPath.empty()) return true;
   const std::string thumb = UITheme::getCoverThumbPath(book.coverBmpPath, thumbHeight);
-  if (Storage.exists(thumb.c_str())) return true;
-  // A book that failed once this session is not retried on every visit: the
-  // retry loop is what showed the loading popup over and over.
+  if (Storage.exists(thumb.c_str())) return false;
   for (const std::string& failed : thumbFailures) {
     if (failed == thumb) return false;
   }
+  return true;
+}
+
+bool HomeActivity::ensureCoverThumbFor(RecentBook& book, const int thumbHeight) {
+  // An entry can carry no cover path: the store only learns it once the reader
+  // has produced one. Ask the book itself instead of drawing a blank tile
+  // forever — and keep it on the heap: EPUB/XTC objects blow the stack budget
+  // (one parser lives at a time).
+  if (book.coverBmpPath.empty()) {
+    if (FsHelpers::hasReflowableBookExtension(book.path)) {
+      auto epub = makeUniqueNoThrow<Epub>(book.path, "/.crosspoint");
+      if (!epub) {
+        LOG_ERR("HOME", "OOM: cover path EPUB");
+        return false;
+      }
+      book.coverBmpPath = epub->getThumbBmpPath();
+    } else if (FsHelpers::hasXtcExtension(book.path)) {
+      auto xtc = makeUniqueNoThrow<Xtc>(book.path, "/.crosspoint");
+      if (!xtc) {
+        LOG_ERR("HOME", "OOM: cover path XTC");
+        return false;
+      }
+      book.coverBmpPath = xtc->getThumbBmpPath();
+    }
+    if (book.coverBmpPath.empty()) {
+      LOG_ERR("HOME", "no cover path for %s", book.path.c_str());
+      thumbFailures.push_back(book.path);  // do not ask again this session
+      return false;
+    }
+  }
+
+  const std::string thumb = UITheme::getCoverThumbPath(book.coverBmpPath, thumbHeight);
+  if (Storage.exists(thumb.c_str())) return true;
+  for (const std::string& failed : thumbFailures) {
+    if (failed == thumb) return false;
+  }
+
   bool ok = false;
   if (FsHelpers::hasReflowableBookExtension(book.path)) {
-    // generateThumbBmpFromSource locates the cover WITHOUT building the spine,
-    // TOC or reading caches. That metadata build was the slow part: a full
-    // epub load per book is seconds, this is a zip walk.
-    Epub epub(book.path, "/.crosspoint");
-    ok = epub.generateThumbBmpFromSource(thumbHeight);
+    auto epub = makeUniqueNoThrow<Epub>(book.path, "/.crosspoint");
+    if (!epub) {
+      LOG_ERR("HOME", "OOM: cover EPUB");
+      return false;
+    }
+    // generateThumbBmpFromSource locates the cover without building the spine,
+    // TOC or reading caches: that metadata build was the seconds-per-book cost.
+    ok = epub->generateThumbBmpFromSource(thumbHeight);
   } else if (FsHelpers::hasXtcExtension(book.path)) {
-    Xtc xtc(book.path, "/.crosspoint");
-    if (xtc.load()) ok = xtc.generateThumbBmp(thumbHeight);
+    auto xtc = makeUniqueNoThrow<Xtc>(book.path, "/.crosspoint");
+    if (!xtc) {
+      LOG_ERR("HOME", "OOM: cover XTC");
+      return false;
+    }
+    ok = xtc->load() && xtc->generateThumbBmp(thumbHeight);
   }
   if (!ok) {
     thumbFailures.push_back(thumb);
