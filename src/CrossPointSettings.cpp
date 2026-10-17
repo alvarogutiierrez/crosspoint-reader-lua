@@ -1,5 +1,6 @@
 #include "CrossPointSettings.h"
 
+#include <BlePageTurnerJson.h>
 #include <I18n.h>
 #include <Logging.h>
 #include <ObfuscationUtils.h>
@@ -15,6 +16,7 @@
 #include "SettingsList.h"
 #include "fontIds.h"
 #include "util/ParagraphIndentMigration.h"
+#include "util/PluginLocations.h"
 
 namespace {
 
@@ -115,6 +117,8 @@ void CrossPointSettings::toJson(JsonDocument& doc) const {
   if (keyboardLayouts != 0) {
     doc["keyboardLayouts"] = keyboardLayouts;
   }
+
+  bleturner::writeJson(ble, doc);
 }
 
 bool CrossPointSettings::fromJson(JsonVariantConst doc) {
@@ -184,6 +188,14 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
     }
   }
 
+  // Plugin System did not exist in older settings files. Preserve the behavior
+  // of users who already have SD plugins installed, while keeping the new
+  // default disabled on clean installs.
+  if (doc["pluginsEnabled"].isNull()) {
+    pluginsEnabled = PluginLocations::anyPluginInstalledOnDisk() ? 1 : 0;
+    needsResave = true;
+  }
+
   const auto indentSpaces = doc["paragraphIndentSpaces"];
   const bool hasSavedWidth = indentSpaces.is<int>();
   const int savedWidth = hasSavedWidth ? indentSpaces.as<int>() : 0;
@@ -237,7 +249,7 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
   // These controls use board-specific display-index mappings and are skipped by
   // the generic settings loop. Persisted action IDs remain stable across boards.
   longPressMenuFunction = clamp(doc["longPressMenuFunction"] | (uint8_t)LP_MENU_DISABLED,
-                                (uint8_t)(LP_MENU_CREATE_CLIPPING + 1), (uint8_t)LP_MENU_DISABLED);
+                                (uint8_t)LONG_PRESS_MENU_FUNCTION_COUNT, (uint8_t)LP_MENU_DISABLED);
   shortPwrBtn = clamp(doc["shortPwrBtn"] | (uint8_t)IGNORE, (uint8_t)SHORT_PWRBTN_COUNT, (uint8_t)IGNORE);
   if (BoardConfig::hasHomeKey() && doc["homeButtonLongPressAction"].isNull() &&
       !doc["longPressMenuFunction"].isNull()) {
@@ -272,6 +284,10 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
   // Absent means unconfigured, which is the default.
   if (doc["keyboardLayouts"].is<uint16_t>()) {
     keyboardLayouts = doc["keyboardLayouts"].as<uint16_t>();
+  }
+
+  if (!bleturner::readJson(ble, doc)) {
+    needsResave = true;
   }
 
   if (needsResave) {
